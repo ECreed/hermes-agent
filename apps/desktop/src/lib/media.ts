@@ -58,22 +58,12 @@ export function mediaMarkdownHref(path: string): string {
   return `#media:${encodeURIComponent(path)}`
 }
 
-// Resolve a media path to a URL the shell can open. Remote mode rewrites
-// gateway-local paths to an authenticated /api/files/download URL (the file
-// lives on the gateway, not this disk); local mode keeps the file:// form.
+// Resolve a media path without embedding connection credentials. Remote desktop
+// callers must use gatewayMediaDataUrl/downloadGatewayMediaFile so authentication
+// stays in the native bridge request rather than a browser-visible URL.
 export function mediaExternalUrl(path: string): string {
   if (/^https?:/i.test(path)) {
     return path
-  }
-
-  if (isRemoteGateway()) {
-    const conn = $connection.get()
-
-    if (conn?.baseUrl && conn.token) {
-      const file = encodeURIComponent(filePathFromMediaPath(path))
-
-      return `${conn.baseUrl}/api/files/download?path=${file}&token=${encodeURIComponent(conn.token)}`
-    }
   }
 
   return /^file:/i.test(path) ? path : `file://${path}`

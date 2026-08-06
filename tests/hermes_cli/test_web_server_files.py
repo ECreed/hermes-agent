@@ -276,20 +276,19 @@ def test_download_returns_file_as_attachment(forced_files_client):
     assert "hello.txt" in disposition
 
 
-def test_download_authenticates_via_query_token(forced_files_client):
+def test_download_rejects_session_token_in_query(forced_files_client):
     client, root = forced_files_client
     file_path = _seed_file(client, root)
 
-    # Drop the session header so only the ?token= query param authenticates —
-    # mirrors a browser/shell-opened download that can't set the session header.
+    # Download credentials belong in the session header, never a URL retained by
+    # browser history or reverse-proxy access logs.
     del client.headers[web_server._SESSION_HEADER_NAME]
 
-    ok = client.get(
+    rejected = client.get(
         "/api/files/download",
         params={"path": str(file_path), "token": web_server._SESSION_TOKEN},
     )
-    assert ok.status_code == 200
-    assert ok.content == b"hello"
+    assert rejected.status_code == 401
 
     assert client.get(
         "/api/files/download", params={"path": str(file_path), "token": "nope"}

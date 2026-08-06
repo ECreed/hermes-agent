@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api } from "./api";
+import { api, buildArtifactDownloadHref } from "./api";
 
 const SESSION_HEADER = "X-Hermes-Session-Token";
 
@@ -46,6 +46,36 @@ describe("api.getModelOptions", () => {
       "/api/model/options?profile=default&refresh=1&include_unconfigured=1",
       expect.objectContaining({ credentials: "include" }),
     );
+  });
+});
+
+describe("authenticated downloads", () => {
+  it("never places the dashboard session token in an artifact URL", () => {
+    vi.stubGlobal("window", { __HERMES_SESSION_TOKEN__: "unit-test-session-token" });
+
+    const href = buildArtifactDownloadHref("artifact id");
+
+    expect(href).toBe("/api/artifacts/download?id=artifact+id");
+    expect(href).not.toContain("unit-test-session-token");
+    expect(href).not.toContain("token=");
+  });
+
+  it("sends download credentials in a header instead of the URL", async () => {
+    vi.stubGlobal("window", { __HERMES_SESSION_TOKEN__: "unit-test-session-token" });
+    const fetchMock = vi.fn<typeof fetch>(
+      async () => new Response("artifact", { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.downloadArtifact("artifact id");
+    await api.downloadFile("/tmp/report.txt");
+
+    for (const call of fetchMock.mock.calls) {
+      const [url, init] = call;
+      expect(String(url)).not.toContain("unit-test-session-token");
+      expect(String(url)).not.toContain("token=");
+      expect((init?.headers as Headers).get(SESSION_HEADER)).toBe("unit-test-session-token");
+    }
   });
 });
 

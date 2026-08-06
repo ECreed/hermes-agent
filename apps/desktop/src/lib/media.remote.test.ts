@@ -59,14 +59,15 @@ describe('mediaExternalUrl', () => {
     expect(mediaExternalUrl('file:///tmp/a.png')).toBe('file:///tmp/a.png')
   })
 
-  it('rewrites gateway-local paths to an authenticated download URL', () => {
+  it('never embeds the remote connection token in a download URL', () => {
     $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 's e/cret' } as never)
-    expect(mediaExternalUrl('file:///tmp/a b.png')).toBe(
-      'https://gw/api/files/download?path=%2Ftmp%2Fa%20b.png&token=s%20e%2Fcret'
-    )
-    expect(mediaExternalUrl('/tmp/a b.png')).toBe(
-      'https://gw/api/files/download?path=%2Ftmp%2Fa%20b.png&token=s%20e%2Fcret'
-    )
+    const fromFileUrl = mediaExternalUrl('file:///tmp/a b.png')
+    const fromPath = mediaExternalUrl('/tmp/a b.png')
+
+    expect(fromFileUrl).toBe('file:///tmp/a b.png')
+    expect(fromPath).toBe('file:///tmp/a b.png')
+    expect(fromFileUrl).not.toContain('s e/cret')
+    expect(fromPath).not.toContain('token=')
   })
 
   it('falls back to file:// when remote connection lacks a token', () => {

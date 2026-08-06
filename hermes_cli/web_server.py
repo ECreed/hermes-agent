@@ -361,13 +361,10 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
-# Routes that may also authenticate via a ``?token=`` query param, for download
-# links opened by the OS shell or a new browser tab where the session header
-# can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
-_QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({
-    "/api/files/download",
-    "/api/artifacts/download",
-})
+# HTTP downloads use the session header or authenticated cookie. Long-lived
+# session credentials must never be placed in URLs, where browser history,
+# reverse-proxy access logs, and referrer headers can retain them.
+_QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset()
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
@@ -1834,6 +1831,46 @@ _ARTIFACT_EXCLUDED_DIR_NAMES = _SENSITIVE_MANAGED_DIR_NAMES | frozenset({
     "venv",
 })
 _ARTIFACT_KIND_VALUES = frozenset({"archive", "bundle", "file", "image", "link"})
+_ARTIFACT_TEXT_SCAN_MAX_BYTES = 16 * 1024 * 1024
+_ARTIFACT_TEXT_SUFFIXES = frozenset({
+    ".cfg",
+    ".conf",
+    ".css",
+    ".csv",
+    ".html",
+    ".ini",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".jsx",
+    ".log",
+    ".md",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".rst",
+    ".sh",
+    ".sql",
+    ".toml",
+    ".ts",
+    ".tsv",
+    ".tsx",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+})
+_ARTIFACT_SAFE_BINARY_MIME_PREFIXES = ("audio/", "image/", "video/")
+_ARTIFACT_SENSITIVE_FIELD_SUFFIXES = (
+    "api_key",
+    "authorization",
+    "credential",
+    "password",
+    "passwd",
+    "private_key",
+    "secret",
+    "token",
+)
 
 
 def _artifact_safe_name(value: str) -> str:
@@ -2090,6 +2127,87 @@ def _artifact_project_or_404(project_ref: str | None = None) -> Dict[str, Any]:
     return project
 
 
+def _artifact_sensitive_field_name(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
+    return any(
+        normalized == suffix or normalized.endswith(f"_{suffix}")
+        for suffix in _ARTIFACT_SENSITIVE_FIELD_SUFFIXES
+    )
+
+
+def _artifact_redact_text(text: str) -> tuple[str, int]:
+    # Lazy import keeps dashboard module initialization independent from the
+    # agent package while still reusing Hermes' maintained credential patterns.
+    from agent.redact import redact_sensitive_text
+
+    redacted = redact_sensitive_text(text, force=True)
+    return redacted, int(redacted != text)
+
+
+def _artifact_sanitize_value(value: Any) -> tuple[Any, int]:
+    if isinstance(value, dict):
+        result: Dict[str, Any] = {}
+        redactions = 0
+        for key, item in value.items():
+            key_text = str(key)
+            if _artifact_sensitive_field_name(key_text):
+                result[key_text] = "<REDACTED>"
+                redactions += 1
+                continue
+            sanitized, count = _artifact_sanitize_value(item)
+            result[key_text] = sanitized
+            redactions += count
+        return result, redactions
+    if isinstance(value, list):
+        result_list: List[Any] = []
+        redactions = 0
+        for item in value:
+            sanitized, count = _artifact_sanitize_value(item)
+            result_list.append(sanitized)
+            redactions += count
+        return result_list, redactions
+    if isinstance(value, tuple):
+        sanitized, redactions = _artifact_sanitize_value(list(value))
+        return sanitized, redactions
+    if isinstance(value, str):
+        return _artifact_redact_text(value)
+    return value, 0
+
+
+def _artifact_write_json_to_zip(
+    archive: zipfile.ZipFile,
+    arcname: str,
+    value: Any,
+    manifest_files: List[Dict[str, Any]],
+) -> None:
+    sanitized, redactions = _artifact_sanitize_value(value)
+    content = json.dumps(sanitized, ensure_ascii=False, indent=2)
+    archive.writestr(arcname, content)
+    entry: Dict[str, Any] = {"path": arcname, "bytes": len(content.encode("utf-8"))}
+    if redactions:
+        entry["redacted"] = True
+        entry["redactions"] = redactions
+    manifest_files.append(entry)
+
+
+def _artifact_file_is_text(path: Path, mime_type: str) -> bool:
+    return mime_type.startswith("text/") or path.suffix.lower() in _ARTIFACT_TEXT_SUFFIXES
+
+
+def _artifact_security_report(manifest_files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    skipped: Dict[str, int] = {}
+    for entry in manifest_files:
+        reason = entry.get("skipped")
+        if reason:
+            skipped[str(reason)] = skipped.get(str(reason), 0) + 1
+    return {
+        "policy": "authenticated-request; sensitive paths denied; text force-redacted",
+        "redacted_entries": sum(1 for entry in manifest_files if entry.get("redacted")),
+        "redactions": sum(int(entry.get("redactions") or 0) for entry in manifest_files),
+        "skipped_entries": skipped,
+    }
+
+
 def _artifact_skip_bundle_path(path: Path) -> bool:
     lowered_parts = {part.lower() for part in path.parts}
     if lowered_parts.intersection(_ARTIFACT_EXCLUDED_DIR_NAMES):
@@ -2103,19 +2221,59 @@ def _artifact_add_file_to_zip(
     arcname: str,
     manifest_files: List[Dict[str, Any]],
 ) -> None:
-    if _artifact_skip_bundle_path(path) or not path.is_file():
+    if not path.is_file():
         return
     try:
         st = path.stat()
     except OSError:
+        manifest_files.append({"path": arcname, "skipped": "unreadable"})
+        return
+    if _artifact_skip_bundle_path(path):
+        manifest_files.append({"path": arcname, "bytes": st.st_size, "skipped": "sensitive_path"})
         return
     if st.st_size > _MANAGED_FILE_MAX_BYTES:
         manifest_files.append({"path": arcname, "bytes": st.st_size, "skipped": "too_large"})
         return
+
+    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     try:
-        archive.write(path, arcname)
-        manifest_files.append({"path": arcname, "bytes": st.st_size, "mtime": int(st.st_mtime)})
-    except OSError:
+        if _artifact_file_is_text(path, mime_type):
+            if st.st_size > _ARTIFACT_TEXT_SCAN_MAX_BYTES:
+                manifest_files.append({
+                    "path": arcname,
+                    "bytes": st.st_size,
+                    "skipped": "too_large_to_scan",
+                })
+                return
+            try:
+                content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                manifest_files.append({
+                    "path": arcname,
+                    "bytes": st.st_size,
+                    "skipped": "unscannable_text",
+                })
+                return
+            sanitized, redactions = _artifact_redact_text(content)
+            encoded = sanitized.encode("utf-8")
+            archive.writestr(arcname, encoded)
+            entry: Dict[str, Any] = {
+                "path": arcname,
+                "bytes": len(encoded),
+                "source_bytes": st.st_size,
+                "mtime": int(st.st_mtime),
+            }
+            if redactions:
+                entry["redacted"] = True
+                entry["redactions"] = redactions
+            manifest_files.append(entry)
+            return
+        if mime_type.startswith(_ARTIFACT_SAFE_BINARY_MIME_PREFIXES):
+            archive.write(path, arcname)
+            manifest_files.append({"path": arcname, "bytes": st.st_size, "mtime": int(st.st_mtime)})
+            return
+        manifest_files.append({"path": arcname, "bytes": st.st_size, "skipped": "unscannable_binary"})
+    except (OSError, UnicodeError):
         manifest_files.append({"path": arcname, "bytes": st.st_size, "skipped": "unreadable"})
 
 
@@ -2128,8 +2286,6 @@ def _artifact_add_tree_to_zip(
     if not root.exists() or not root.is_dir():
         return
     for child in sorted(root.rglob("*")):
-        if _artifact_skip_bundle_path(child):
-            continue
         if child.is_file():
             arcname = f"{arc_prefix}/{child.relative_to(root).as_posix()}"
             _artifact_add_file_to_zip(archive, child, arcname, manifest_files)
@@ -2179,9 +2335,26 @@ def _artifact_add_project_audit(
     except OSError:
         return
     if lines:
-        content = "".join(lines)
+        sanitized_lines: List[str] = []
+        redactions = 0
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                sanitized, count = _artifact_redact_text(line)
+                sanitized_lines.append(sanitized)
+                redactions += count
+            else:
+                sanitized, count = _artifact_sanitize_value(event)
+                sanitized_lines.append(json.dumps(sanitized, ensure_ascii=False, separators=(",", ":")) + "\n")
+                redactions += count
+        content = "".join(sanitized_lines)
         archive.writestr("audit/events.jsonl", content)
-        manifest_files.append({"path": "audit/events.jsonl", "bytes": len(content.encode("utf-8"))})
+        entry: Dict[str, Any] = {"path": "audit/events.jsonl", "bytes": len(content.encode("utf-8"))}
+        if redactions:
+            entry["redacted"] = True
+            entry["redactions"] = redactions
+        manifest_files.append(entry)
 
 
 def _create_artifact_project_bundle(project_ref: str | None, include_archives: bool) -> Dict[str, Any]:
@@ -2205,17 +2378,9 @@ def _create_artifact_project_bundle(project_ref: str | None, include_archives: b
 
     try:
         with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
-            archive.writestr("manifest.json", manifest_text)
-            manifest_files.append({"path": "manifest.json", "bytes": len(manifest_text.encode("utf-8"))})
-
-            project_text = json.dumps(project, ensure_ascii=False, indent=2)
-            archive.writestr("memory/project.json", project_text)
-            manifest_files.append({"path": "memory/project.json", "bytes": len(project_text.encode("utf-8"))})
-
-            memory_text = json.dumps(memory_rows, ensure_ascii=False, indent=2)
-            archive.writestr("memory/entries.json", memory_text)
-            manifest_files.append({"path": "memory/entries.json", "bytes": len(memory_text.encode("utf-8"))})
+            _artifact_write_json_to_zip(archive, "manifest.json", manifest, manifest_files)
+            _artifact_write_json_to_zip(archive, "memory/project.json", project, manifest_files)
+            _artifact_write_json_to_zip(archive, "memory/entries.json", memory_rows, manifest_files)
 
             if project_root.exists() and project_root.is_dir():
                 _artifact_add_tree_to_zip(archive, project_root, f"projects/{slug}", manifest_files)
@@ -2236,6 +2401,12 @@ def _create_artifact_project_bundle(project_ref: str | None, include_archives: b
                             )
 
             _artifact_add_project_audit(archive, project, manifest_files)
+            security_report = _artifact_security_report(manifest_files)
+            security_text = json.dumps(security_report, ensure_ascii=False, indent=2)
+            archive.writestr("security-report.json", security_text)
+            manifest_files.append({
+                "path": "security-report.json", "bytes": len(security_text.encode("utf-8"))
+            })
             archive.writestr("manifest.files.json", json.dumps(manifest_files, ensure_ascii=False, indent=2))
     except OSError as exc:
         target.unlink(missing_ok=True)
@@ -2336,13 +2507,11 @@ async def read_managed_file(request: Request, path: str):
 async def download_managed_file(request: Request, path: str):
     """Stream a managed file as an attachment download.
 
-    Remote clients (desktop app, browser dashboard) open agent-written files
-    that live on *this* gateway's disk, not theirs. Auth-gated like every other
-    managed-files route — ``auth_middleware`` additionally accepts the session
-    token as a ``?token=`` query param here so a shell/browser-opened download
-    (which can't set the session header) still authenticates. See ``/api/pty``
-    for the same query-token precedent.
+    Dashboard callers use ``authedFetch`` and the desktop uses its authenticated
+    filesystem bridge. Session credentials are deliberately rejected in query
+    strings so they cannot leak through URL logging or browser history.
     """
+    _require_token(request)
     policy, target, _display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -2375,7 +2544,7 @@ async def list_artifacts(
     project: Optional[str] = None,
     session_id: Optional[str] = None,
 ):
-    del request
+    _require_token(request)
     return {
         "artifacts": _recent_artifact_records(
             limit=max(1, min(500, int(limit or 100))),
@@ -2387,7 +2556,7 @@ async def list_artifacts(
 
 @app.post("/api/artifacts/register")
 async def register_artifact(payload: ArtifactRegisterRequest, request: Request):
-    del request
+    _require_token(request)
     record = _artifact_record_for_path(
         Path(payload.path),
         label=payload.label,
@@ -2402,7 +2571,7 @@ async def register_artifact(payload: ArtifactRegisterRequest, request: Request):
 
 @app.get("/api/artifacts/download")
 async def download_artifact(request: Request, id: str):
-    del request
+    _require_token(request)
     record = _find_artifact_record(id)
     if not record:
         raise HTTPException(status_code=404, detail="Artifact not found")
@@ -2417,7 +2586,7 @@ async def download_artifact(request: Request, id: str):
 
 @app.post("/api/artifacts/project-bundle")
 async def create_project_bundle(payload: ArtifactProjectBundleRequest, request: Request):
-    del request
+    _require_token(request)
     return await run_in_threadpool(
         _create_artifact_project_bundle,
         payload.project,

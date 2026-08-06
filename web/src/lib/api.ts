@@ -269,10 +269,6 @@ export async function authedFetch(
 export function buildArtifactDownloadHref(id: string): string {
   const qs = new URLSearchParams();
   qs.set("id", id);
-  const token = window.__HERMES_SESSION_TOKEN__;
-  if (token) {
-    qs.set("token", token);
-  }
   return `${BASE}/api/artifacts/download?${qs.toString()}`;
 }
 
