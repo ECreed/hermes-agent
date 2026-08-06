@@ -6,8 +6,13 @@ const REASONING_LABELS: Record<string, string> = {
   low: 'Low',
   medium: 'Med',
   high: 'High',
-  xhigh: 'Max'
+  xhigh: 'XHigh',
+  max: 'Max'
 }
+
+export const DEFAULT_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const
+
+const KNOWN_REASONING_EFFORTS = new Set<string>(['none', ...DEFAULT_REASONING_EFFORTS, 'max'])
 
 export function reasoningEffortLabel(effort: string): string {
   const key = normalize(effort)
@@ -17,6 +22,41 @@ export function reasoningEffortLabel(effort: string): string {
   }
 
   return REASONING_LABELS[key] ?? effort
+}
+
+export function normalizeReasoningEfforts(efforts?: readonly unknown[]): string[] {
+  const source = Array.isArray(efforts) && efforts.length > 0 ? efforts : DEFAULT_REASONING_EFFORTS
+  const seen = new Set<string>()
+  const values: string[] = []
+
+  for (const item of source) {
+    const value = normalize(String(item ?? ''))
+
+    if (!value || value === 'none' || !KNOWN_REASONING_EFFORTS.has(value) || seen.has(value)) {
+      continue
+    }
+
+    seen.add(value)
+    values.push(value)
+  }
+
+  return values.length > 0 ? values : [...DEFAULT_REASONING_EFFORTS]
+}
+
+export function normalizeReasoningEffort(effort: string, efforts?: readonly unknown[]): string {
+  const value = normalize(effort || 'medium')
+
+  if (value === 'none') {
+    return 'none'
+  }
+
+  const supported = normalizeReasoningEfforts(efforts)
+
+  if (supported.includes(value)) {
+    return value
+  }
+
+  return supported.includes('medium') ? 'medium' : (supported[0] ?? 'medium')
 }
 
 /** Which model/provider a picker should mark "current". With a live session the

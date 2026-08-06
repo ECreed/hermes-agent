@@ -334,6 +334,8 @@ _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD = 0.85
 # the 128K hard limit.
 _CODEX_SPARK_COMPACTION_THRESHOLD = 0.70
 
+_Z13_LOCAL_QWEN36_128K_COMPACTION_THRESHOLD = 0.82
+
 
 def _is_codex_gpt54_or_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
     """True for gpt-5.4 / gpt-5.5 on the ChatGPT Codex OAuth backend.
@@ -372,6 +374,14 @@ def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> boo
         return False
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
     return bare == "gpt-5.3-codex-spark"
+
+
+def _is_z13_local_qwen36_128k(model: Optional[str], provider: Optional[str] = None) -> bool:
+    prov = (provider or "").strip().lower()
+    if not prov.startswith("z13-qwen36-35b"):
+        return False
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1]
+    return bare.startswith("qwen3.6:35b")
 
 
 def _fixed_temperature_for_model(
@@ -430,6 +440,8 @@ def _compression_threshold_for_model(
         return _CODEX_GPT54_GPT55_COMPACTION_THRESHOLD
     if _is_codex_spark(model, provider):
         return _CODEX_SPARK_COMPACTION_THRESHOLD
+    if _is_z13_local_qwen36_128k(model, provider):
+        return _Z13_LOCAL_QWEN36_128K_COMPACTION_THRESHOLD
     return None
 
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)

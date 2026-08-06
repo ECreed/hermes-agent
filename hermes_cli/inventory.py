@@ -263,27 +263,44 @@ def _apply_capabilities(rows: list[dict]) -> None:
     from hermes_cli.models import model_supports_fast_mode
 
     try:
-        from agent.models_dev import get_model_capabilities
+        from agent.models_dev import get_model_capabilities, infer_model_reasoning_efforts
     except Exception:
         get_model_capabilities = None  # type: ignore[assignment]
+        infer_model_reasoning_efforts = None  # type: ignore[assignment]
 
     for row in rows:
         slug = row.get("slug") or ""
-        caps: dict[str, dict[str, bool]] = {}
+        caps: dict[str, dict[str, object]] = {}
 
         for model in row.get("models") or []:
             reasoning = True
+            reasoning_efforts: list[str] = []
             if get_model_capabilities is not None and slug:
                 try:
                     meta = get_model_capabilities(slug, model)
                     if meta is not None:
                         reasoning = bool(meta.supports_reasoning)
+                        reasoning_efforts = list(meta.reasoning_efforts or ())
                 except Exception:
                     reasoning = True
+                    reasoning_efforts = []
+
+            if reasoning and not reasoning_efforts and infer_model_reasoning_efforts is not None:
+                try:
+                    reasoning_efforts = list(
+                        infer_model_reasoning_efforts(
+                            slug,
+                            model,
+                            supports_reasoning=reasoning,
+                        )
+                    )
+                except Exception:
+                    reasoning_efforts = []
 
             caps[model] = {
                 "fast": bool(model_supports_fast_mode(model)),
                 "reasoning": reasoning,
+                "reasoning_efforts": reasoning_efforts,
             }
 
         row["capabilities"] = caps

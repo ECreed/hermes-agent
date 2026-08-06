@@ -266,6 +266,16 @@ export async function authedFetch(
   });
 }
 
+export function buildArtifactDownloadHref(id: string): string {
+  const qs = new URLSearchParams();
+  qs.set("id", id);
+  const token = window.__HERMES_SESSION_TOKEN__;
+  if (token) {
+    qs.set("token", token);
+  }
+  return `${BASE}/api/artifacts/download?${qs.toString()}`;
+}
+
 /**
  * Build an absolute ``ws(s)://`` URL for a dashboard WebSocket endpoint,
  * with the correct auth query param appended for the active mode (fresh
@@ -448,6 +458,30 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, recursive }),
     }),
+  listArtifacts: (params?: { limit?: number; project?: string; session_id?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.limit) qs.set("limit", String(params.limit));
+    if (params?.project) qs.set("project", params.project);
+    if (params?.session_id) qs.set("session_id", params.session_id);
+    const query = qs.toString();
+    return fetchJSON<ArtifactsResponse>(`/api/artifacts${query ? `?${query}` : ""}`);
+  },
+  registerArtifact: (payload: ArtifactRegisterRequest) =>
+    fetchJSON<ArtifactActionResponse>("/api/artifacts/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  createProjectBundle: (payload: ProjectBundleRequest = {}) =>
+    fetchJSON<ProjectBundleResponse>("/api/artifacts/project-bundle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  downloadArtifact: (id: string) =>
+    authedFetch(`/api/artifacts/download?id=${encodeURIComponent(id)}`),
+  downloadFile: (path: string) =>
+    authedFetch(`/api/files/download?path=${encodeURIComponent(path)}`),
   getLogs: (params: { file?: string; lines?: number; level?: string; component?: string }) => {
     const qs = new URLSearchParams();
     if (params.file) qs.set("file", params.file);
@@ -1948,6 +1982,48 @@ export interface ManagedFileWriteResponse {
   can_change_path: boolean;
 }
 
+export interface ArtifactRecord {
+  id: string;
+  kind: "archive" | "bundle" | "file" | "image" | "link";
+  label: string;
+  name: string;
+  path: string;
+  size: number;
+  mtime: number;
+  mime_type: string;
+  session_id: string | null;
+  project: string | null;
+  created_at: number;
+  metadata?: Record<string, unknown>;
+  download_url: string;
+}
+
+export interface ArtifactsResponse {
+  artifacts: ArtifactRecord[];
+}
+
+export interface ArtifactRegisterRequest {
+  path: string;
+  label?: string;
+  session_id?: string;
+  project?: string;
+  kind?: string;
+}
+
+export interface ProjectBundleRequest {
+  project?: string;
+  include_archives?: boolean;
+}
+
+export interface ArtifactActionResponse {
+  ok: boolean;
+  artifact: ArtifactRecord;
+}
+
+export interface ProjectBundleResponse extends ArtifactActionResponse {
+  project: Record<string, unknown>;
+}
+
 export interface AnalyticsDailyEntry {
   day: string;
   input_tokens: number;
@@ -2051,6 +2127,7 @@ export interface ModelsAnalyticsModelEntry {
     supports_tools?: boolean;
     supports_vision?: boolean;
     supports_reasoning?: boolean;
+    reasoning_efforts?: string[];
     context_window?: number;
     max_output_tokens?: number;
     model_family?: string;
@@ -2241,6 +2318,7 @@ export interface ModelInfoResponse {
     supports_tools?: boolean;
     supports_vision?: boolean;
     supports_reasoning?: boolean;
+    reasoning_efforts?: string[];
     context_window?: number;
     max_output_tokens?: number;
     model_family?: string;

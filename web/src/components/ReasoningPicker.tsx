@@ -21,13 +21,12 @@
 
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
 import { Brain } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api } from "@/lib/api";
 import {
-  EFFORT_OPTIONS,
+  effortOptionsFor,
   normalizeEffort,
-  VALID_EFFORTS,
 } from "@/lib/reasoning-effort";
 
 interface ReasoningPickerProps {
@@ -38,6 +37,8 @@ interface ReasoningPickerProps {
   profile?: string;
   /** Bumped after the model picker saves, to re-read config in lockstep. */
   refreshKey?: number;
+  /** Supported effort values loaded from /api/model/info capabilities. */
+  reasoningEfforts?: readonly string[];
   /** Called after a successful change so the sidebar can show an "apply on
    *  /new or reload" notice, matching the model-switch UX. */
   onChanged?: (effort: string) => void;
@@ -46,6 +47,7 @@ interface ReasoningPickerProps {
 export function ReasoningPicker({
   currentModel,
   profile,
+  reasoningEfforts,
   refreshKey = 0,
   onChanged,
 }: ReasoningPickerProps) {
@@ -53,27 +55,38 @@ export function ReasoningPicker({
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const lastFetchKeyRef = useRef("");
+  const effortOptions = useMemo(
+    () => effortOptionsFor(reasoningEfforts),
+    [reasoningEfforts],
+  );
+  const validEfforts = useMemo(
+    () => new Set(effortOptions.map((opt) => opt.value)),
+    [effortOptions],
+  );
 
   useEffect(() => {
-    const fetchKey = `${profile ?? ""}:${currentModel}:${refreshKey}`;
+    const effortsKey = Array.isArray(reasoningEfforts)
+      ? reasoningEfforts.join(",")
+      : "";
+    const fetchKey = `${profile ?? ""}:${currentModel}:${refreshKey}:${effortsKey}`;
     if (fetchKey === lastFetchKeyRef.current) return;
     lastFetchKeyRef.current = fetchKey;
     void api
       .getConfig(profile)
       .then((cfg) => {
         const agent = (cfg?.agent as Record<string, unknown> | undefined) ?? {};
-        setEffort(normalizeEffort(agent.reasoning_effort));
+        setEffort(normalizeEffort(agent.reasoning_effort, reasoningEfforts));
         setLoaded(true);
       })
       .catch(() => {
         // Best-effort: keep the last known value rather than blanking it.
         setLoaded(true);
       });
-  }, [currentModel, profile, refreshKey]);
+  }, [currentModel, profile, reasoningEfforts, refreshKey]);
 
   const onSelect = useCallback(
     (next: string) => {
-      if (!VALID_EFFORTS.has(next) || next === effort) return;
+      if (!validEfforts.has(next) || next === effort) return;
       const prev = effort;
       setEffort(next); // optimistic
       setSaving(true);
@@ -99,7 +112,7 @@ export function ReasoningPicker({
         })
         .finally(() => setSaving(false));
     },
-    [effort, onChanged, profile],
+    [effort, onChanged, profile, validEfforts],
   );
 
   return (
@@ -114,7 +127,7 @@ export function ReasoningPicker({
         onValueChange={onSelect}
         value={effort}
       >
-        {EFFORT_OPTIONS.map((opt) => (
+        {effortOptions.map((opt) => (
           <SelectOption key={opt.value} value={opt.value}>
             {opt.label}
           </SelectOption>

@@ -31,6 +31,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -274,6 +275,30 @@ app.include_router(_memory_oauth_router)
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 
+
+def _desktop_token_auth_enabled() -> bool:
+    """Allow native desktop token auth on a gated bind only when explicitly enabled."""
+    return (
+        env_var_enabled("HERMES_DASHBOARD_ALLOW_DESKTOP_TOKEN")
+        and bool(os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "").strip())
+    )
+
+
+def _desktop_token_session():
+    from hermes_cli.dashboard_auth.base import Session
+
+    now = int(time.time())
+    return Session(
+        user_id="desktop-token",
+        email="",
+        display_name="Hermes Desktop Token",
+        org_id="",
+        provider="desktop-token",
+        expires_at=now + 86400,
+        access_token="",
+        refresh_token="",
+    )
+
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
 # `/api/ws` + `/api/pty` WebSockets, so the embedded-chat surface is an
@@ -339,7 +364,10 @@ def _has_valid_session_token(request: Request) -> bool:
 # Routes that may also authenticate via a ``?token=`` query param, for download
 # links opened by the OS shell or a new browser tab where the session header
 # can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
-_QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
+_QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({
+    "/api/files/download",
+    "/api/artifacts/download",
+})
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
@@ -564,6 +592,13 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
+    if (
+        getattr(request.app.state, "auth_required", False)
+        and _desktop_token_auth_enabled()
+        and _has_valid_session_token(request)
+    ):
+        request.state.session = _desktop_token_session()
+        return await call_next(request)
     from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
     return await gated_auth_middleware(request, call_next)
 
@@ -907,6 +942,19 @@ class ManagedDirectoryCreate(BaseModel):
 class ManagedFileDelete(BaseModel):
     path: str
     recursive: bool = False
+
+
+class ArtifactRegisterRequest(BaseModel):
+    path: str
+    label: Optional[str] = None
+    session_id: Optional[str] = None
+    project: Optional[str] = None
+    kind: Optional[str] = None
+
+
+class ArtifactProjectBundleRequest(BaseModel):
+    project: Optional[str] = None
+    include_archives: bool = False
 
 
 _AUDIO_MIME_EXTENSIONS: Dict[str, str] = {
@@ -1766,6 +1814,457 @@ def _decode_data_url(data_url: str) -> tuple[bytes, str]:
     return data, mime_type
 
 
+_ARTIFACT_INDEX_MAX_RECORDS = 2000
+_ARTIFACT_BUNDLE_MAX_BYTES = 512 * 1024 * 1024
+_ARTIFACT_PROJECTS_DIR = Path(os.environ.get("ZELLM_PROJECTS_DIR", "/ai/projects"))
+_ARTIFACT_MEMORY_DB = Path(os.environ.get("ZELLM_MEMORY_DB", "/ai/runtime/zellm-memory/memory.db"))
+_ARTIFACT_CAPSULE_DIR = Path(os.environ.get("ZELLM_CAPSULE_DIR", "/ai/runtime/zellm-memory/capsules"))
+_ARTIFACT_AUDIT_EVENTS = Path(os.environ.get("ZELLM_PROJECT_AUDIT_EVENTS", "/ai/runtime/zellm-project-audit/events.jsonl"))
+_ARTIFACT_EXCLUDED_DIR_NAMES = _SENSITIVE_MANAGED_DIR_NAMES | frozenset({
+    ".cache",
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "venv",
+})
+_ARTIFACT_KIND_VALUES = frozenset({"archive", "bundle", "file", "image", "link"})
+
+
+def _artifact_safe_name(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "-", (value or "").strip()).strip(".-_")
+    return text[:120] or "artifact"
+
+
+def _artifacts_root() -> Path:
+    root = Path(os.environ.get("HERMES_ARTIFACTS_ROOT") or (get_hermes_home() / "artifacts")).expanduser()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not prepare artifacts root: {exc}")
+
+
+def _artifact_index_path() -> Path:
+    return _artifacts_root() / "index.jsonl"
+
+
+def _artifact_bundles_dir() -> Path:
+    path = _artifacts_root() / "bundles"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not prepare bundles directory: {exc}")
+    return path
+
+
+def _artifact_kind_for_path(path: Path, requested: str | None = None) -> str:
+    kind = (requested or "").strip().lower()
+    if kind in _ARTIFACT_KIND_VALUES:
+        return kind
+    mime_type = mimetypes.guess_type(path.name)[0] or ""
+    if mime_type.startswith("image/"):
+        return "image"
+    if path.suffix.lower() in {".zip", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".7z"}:
+        return "bundle"
+    return "file"
+
+
+def _artifact_label_for_path(path: Path, label: str | None = None) -> str:
+    text = (label or "").strip()
+    return text[:240] if text else path.name
+
+
+def _artifact_download_url(artifact_id: str) -> str:
+    return f"/api/artifacts/download?id={urllib.parse.quote(artifact_id)}"
+
+
+def _artifact_public_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(record)
+    item["download_url"] = _artifact_download_url(str(record["id"]))
+    return item
+
+
+def _artifact_validate_file(path: Path, *, max_bytes: int = _MANAGED_FILE_MAX_BYTES) -> Path:
+    try:
+        target = _canonical_path(path.expanduser(), require_exists=True)
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid artifact path: {exc}")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if not target.is_file():
+        raise HTTPException(status_code=400, detail="Artifact path is not a file")
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Sensitive files cannot be registered as artifacts")
+    try:
+        size = target.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not stat artifact: {exc}")
+    if size > max_bytes:
+        raise HTTPException(status_code=413, detail="Artifact is too large")
+    return target
+
+
+def _artifact_record_for_path(
+    path: Path,
+    *,
+    label: str | None = None,
+    session_id: str | None = None,
+    project: str | None = None,
+    kind: str | None = None,
+    metadata: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    target = _artifact_validate_file(path, max_bytes=_ARTIFACT_BUNDLE_MAX_BYTES)
+    try:
+        st = target.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not stat artifact: {exc}")
+    raw_id = f"{target}:{st.st_size}:{st.st_mtime_ns}:{time.time_ns()}:{secrets.token_hex(8)}"
+    artifact_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:24]
+    return {
+        "id": artifact_id,
+        "kind": _artifact_kind_for_path(target, kind),
+        "label": _artifact_label_for_path(target, label),
+        "name": target.name,
+        "path": str(target),
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "mime_type": mimetypes.guess_type(target.name)[0] or "application/octet-stream",
+        "session_id": (session_id or "").strip() or None,
+        "project": (project or "").strip() or None,
+        "created_at": time.time(),
+        "metadata": metadata or {},
+    }
+
+
+def _read_artifact_records() -> List[Dict[str, Any]]:
+    index_path = _artifact_index_path()
+    if not index_path.exists():
+        return []
+    try:
+        lines = index_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records: List[Dict[str, Any]] = []
+    for line in lines[-_ARTIFACT_INDEX_MAX_RECORDS:]:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and item.get("id") and item.get("path"):
+            records.append(item)
+    return records
+
+
+def _append_artifact_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    index_path = _artifact_index_path()
+    try:
+        with index_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write artifact index: {exc}")
+    return record
+
+
+def _find_artifact_record(artifact_id: str) -> Dict[str, Any] | None:
+    wanted = (artifact_id or "").strip()
+    if not wanted:
+        return None
+    for record in reversed(_read_artifact_records()):
+        if str(record.get("id")) == wanted:
+            return record
+    return None
+
+
+def _recent_artifact_records(
+    *,
+    limit: int,
+    project: str | None = None,
+    session_id: str | None = None,
+) -> List[Dict[str, Any]]:
+    project_filter = (project or "").strip().lower()
+    session_filter = (session_id or "").strip()
+    seen: set[str] = set()
+    results: List[Dict[str, Any]] = []
+    for record in reversed(_read_artifact_records()):
+        artifact_id = str(record.get("id") or "")
+        if not artifact_id or artifact_id in seen:
+            continue
+        seen.add(artifact_id)
+        if project_filter and project_filter not in str(record.get("project") or "").lower():
+            continue
+        if session_filter and str(record.get("session_id") or "") != session_filter:
+            continue
+        try:
+            _artifact_validate_file(Path(str(record["path"])), max_bytes=_ARTIFACT_BUNDLE_MAX_BYTES)
+        except HTTPException:
+            continue
+        results.append(_artifact_public_record(record))
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _artifact_sqlite_rows(query: str, params: tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    if not _ARTIFACT_MEMORY_DB.exists():
+        return []
+    con = sqlite3.connect(_ARTIFACT_MEMORY_DB)
+    con.row_factory = sqlite3.Row
+    try:
+        return [{key: row[key] for key in row.keys()} for row in con.execute(query, params).fetchall()]
+    finally:
+        con.close()
+
+
+def _resolve_artifact_project(project_ref: str | None = None) -> Dict[str, Any] | None:
+    ref = (project_ref or "").strip()
+    if not _ARTIFACT_MEMORY_DB.exists():
+        return None
+    con = sqlite3.connect(_ARTIFACT_MEMORY_DB)
+    con.row_factory = sqlite3.Row
+    try:
+        if ref:
+            row = con.execute(
+                """
+                select distinct p.id, p.slug, p.name, p.summary, p.status, p.importance, p.created_at, p.updated_at
+                  from projects p
+             left join project_aliases a on a.project_id = p.id
+                 where p.id = ? or lower(p.slug) = lower(?) or lower(p.name) = lower(?) or lower(a.alias) = lower(?)
+                 limit 1
+                """,
+                (ref, ref, ref, ref),
+            ).fetchone()
+            return {key: row[key] for key in row.keys()} if row else None
+
+        row = con.execute(
+            """
+            select p.id, p.slug, p.name, p.summary, p.status, p.importance, p.created_at, p.updated_at
+              from projects p
+             where p.status = 'active'
+             order by p.updated_at desc
+             limit 1
+            """
+        ).fetchone()
+        return {key: row[key] for key in row.keys()} if row else None
+    finally:
+        con.close()
+
+
+def _fallback_project_from_dir(project_ref: str | None = None) -> Dict[str, Any] | None:
+    ref = (project_ref or "").strip()
+    if ref:
+        candidate = _ARTIFACT_PROJECTS_DIR / ref if ref not in {".", ".."} and "/" not in ref and "\\" not in ref else None
+        if candidate is not None and candidate.exists() and candidate.is_dir():
+            st = candidate.stat()
+            return {"id": ref, "slug": candidate.name, "name": candidate.name, "updated_at": int(st.st_mtime)}
+        if _ARTIFACT_PROJECTS_DIR.exists():
+            for child in _ARTIFACT_PROJECTS_DIR.iterdir():
+                if child.is_dir() and child.name.lower() == ref.lower():
+                    st = child.stat()
+                    return {"id": child.name, "slug": child.name, "name": child.name, "updated_at": int(st.st_mtime)}
+        return None
+
+    if not _ARTIFACT_PROJECTS_DIR.exists():
+        return None
+    dirs = [child for child in _ARTIFACT_PROJECTS_DIR.iterdir() if child.is_dir() and not _is_sensitive_path(child)]
+    if not dirs:
+        return None
+    newest = max(dirs, key=lambda item: item.stat().st_mtime)
+    st = newest.stat()
+    return {"id": newest.name, "slug": newest.name, "name": newest.name, "updated_at": int(st.st_mtime)}
+
+
+def _artifact_project_or_404(project_ref: str | None = None) -> Dict[str, Any]:
+    project = _resolve_artifact_project(project_ref) or _fallback_project_from_dir(project_ref)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+def _artifact_skip_bundle_path(path: Path) -> bool:
+    lowered_parts = {part.lower() for part in path.parts}
+    if lowered_parts.intersection(_ARTIFACT_EXCLUDED_DIR_NAMES):
+        return True
+    return _is_sensitive_path(path)
+
+
+def _artifact_add_file_to_zip(
+    archive: zipfile.ZipFile,
+    path: Path,
+    arcname: str,
+    manifest_files: List[Dict[str, Any]],
+) -> None:
+    if _artifact_skip_bundle_path(path) or not path.is_file():
+        return
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    if st.st_size > _MANAGED_FILE_MAX_BYTES:
+        manifest_files.append({"path": arcname, "bytes": st.st_size, "skipped": "too_large"})
+        return
+    try:
+        archive.write(path, arcname)
+        manifest_files.append({"path": arcname, "bytes": st.st_size, "mtime": int(st.st_mtime)})
+    except OSError:
+        manifest_files.append({"path": arcname, "bytes": st.st_size, "skipped": "unreadable"})
+
+
+def _artifact_add_tree_to_zip(
+    archive: zipfile.ZipFile,
+    root: Path,
+    arc_prefix: str,
+    manifest_files: List[Dict[str, Any]],
+) -> None:
+    if not root.exists() or not root.is_dir():
+        return
+    for child in sorted(root.rglob("*")):
+        if _artifact_skip_bundle_path(child):
+            continue
+        if child.is_file():
+            arcname = f"{arc_prefix}/{child.relative_to(root).as_posix()}"
+            _artifact_add_file_to_zip(archive, child, arcname, manifest_files)
+
+
+def _artifact_project_memory(project: Dict[str, Any]) -> List[Dict[str, Any]]:
+    project_id = str(project.get("id") or "")
+    if not project_id:
+        return []
+    return _artifact_sqlite_rows(
+        """
+        select id, account_email, project_id, category, subcategory, importance,
+               title, summary, prompt_preview, response_preview, created_at
+          from memory_entries
+         where project_id = ?
+         order by created_at desc
+         limit 500
+        """,
+        (project_id,),
+    )
+
+
+def _artifact_add_project_audit(
+    archive: zipfile.ZipFile,
+    project: Dict[str, Any],
+    manifest_files: List[Dict[str, Any]],
+) -> None:
+    if not _ARTIFACT_AUDIT_EVENTS.exists() or _is_sensitive_path(_ARTIFACT_AUDIT_EVENTS):
+        return
+    needles = {
+        str(project.get("id") or "").lower(),
+        str(project.get("slug") or "").lower(),
+        str(project.get("name") or "").lower(),
+    }
+    needles.discard("")
+    if not needles:
+        return
+    lines: List[str] = []
+    try:
+        with _ARTIFACT_AUDIT_EVENTS.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                lowered = line.lower()
+                if any(needle in lowered for needle in needles):
+                    lines.append(line)
+                if len(lines) >= 5000:
+                    break
+    except OSError:
+        return
+    if lines:
+        content = "".join(lines)
+        archive.writestr("audit/events.jsonl", content)
+        manifest_files.append({"path": "audit/events.jsonl", "bytes": len(content.encode("utf-8"))})
+
+
+def _create_artifact_project_bundle(project_ref: str | None, include_archives: bool) -> Dict[str, Any]:
+    project = _artifact_project_or_404(project_ref)
+    slug = str(project.get("slug") or project.get("name") or project.get("id") or "project")
+    safe_slug_text = _artifact_safe_name(slug)
+    created = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = _artifact_bundles_dir() / f"project-{safe_slug_text}-{created}.zip"
+    manifest_files: List[Dict[str, Any]] = []
+    project_root = _ARTIFACT_PROJECTS_DIR / slug
+    capsule_file = _ARTIFACT_CAPSULE_DIR / f"{slug}.json"
+    memory_rows = _artifact_project_memory(project)
+    manifest = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "project": project,
+        "project_root": str(project_root) if project_root.exists() else None,
+        "capsule": str(capsule_file) if capsule_file.exists() else None,
+        "memory_entries_count": len(memory_rows),
+        "include_archives": include_archives,
+    }
+
+    try:
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            manifest_text = json.dumps(manifest, ensure_ascii=False, indent=2)
+            archive.writestr("manifest.json", manifest_text)
+            manifest_files.append({"path": "manifest.json", "bytes": len(manifest_text.encode("utf-8"))})
+
+            project_text = json.dumps(project, ensure_ascii=False, indent=2)
+            archive.writestr("memory/project.json", project_text)
+            manifest_files.append({"path": "memory/project.json", "bytes": len(project_text.encode("utf-8"))})
+
+            memory_text = json.dumps(memory_rows, ensure_ascii=False, indent=2)
+            archive.writestr("memory/entries.json", memory_text)
+            manifest_files.append({"path": "memory/entries.json", "bytes": len(memory_text.encode("utf-8"))})
+
+            if project_root.exists() and project_root.is_dir():
+                _artifact_add_tree_to_zip(archive, project_root, f"projects/{slug}", manifest_files)
+
+            if capsule_file.exists():
+                _artifact_add_file_to_zip(archive, capsule_file, f"capsules/{capsule_file.name}", manifest_files)
+
+            if include_archives:
+                archive_root = _ARTIFACT_CAPSULE_DIR / "archive"
+                if archive_root.exists():
+                    for child in sorted(archive_root.rglob(f"*{slug}*")):
+                        if child.is_file():
+                            _artifact_add_file_to_zip(
+                                archive,
+                                child,
+                                f"capsules/archive/{child.relative_to(archive_root).as_posix()}",
+                                manifest_files,
+                            )
+
+            _artifact_add_project_audit(archive, project, manifest_files)
+            archive.writestr("manifest.files.json", json.dumps(manifest_files, ensure_ascii=False, indent=2))
+    except OSError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Could not create project bundle: {exc}")
+
+    try:
+        bundle_size = target.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not stat project bundle: {exc}")
+    if bundle_size > _ARTIFACT_BUNDLE_MAX_BYTES:
+        target.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="Project bundle is too large")
+
+    record = _artifact_record_for_path(
+        target,
+        label=f"{project.get('name') or slug} project bundle",
+        project=slug,
+        kind="bundle",
+        metadata={
+            "source": "project-bundle",
+            "project": project,
+            "include_archives": include_archives,
+            "files_count": len(manifest_files),
+        },
+    )
+    _append_artifact_record(record)
+    return {"ok": True, "project": project, "artifact": _artifact_public_record(record)}
+
+
 @app.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
     policy, target, display_path = _resolve_managed_path(path, request)
@@ -1866,6 +2365,63 @@ async def download_managed_file(request: Request, path: str):
         media_type=mime_type,
         filename=target.name,
         content_disposition_type="attachment",
+    )
+
+
+@app.get("/api/artifacts")
+async def list_artifacts(
+    request: Request,
+    limit: int = 100,
+    project: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    del request
+    return {
+        "artifacts": _recent_artifact_records(
+            limit=max(1, min(500, int(limit or 100))),
+            project=project,
+            session_id=session_id,
+        )
+    }
+
+
+@app.post("/api/artifacts/register")
+async def register_artifact(payload: ArtifactRegisterRequest, request: Request):
+    del request
+    record = _artifact_record_for_path(
+        Path(payload.path),
+        label=payload.label,
+        session_id=payload.session_id,
+        project=payload.project,
+        kind=payload.kind,
+        metadata={"source": "register"},
+    )
+    _append_artifact_record(record)
+    return {"ok": True, "artifact": _artifact_public_record(record)}
+
+
+@app.get("/api/artifacts/download")
+async def download_artifact(request: Request, id: str):
+    del request
+    record = _find_artifact_record(id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    target = _artifact_validate_file(Path(str(record["path"])), max_bytes=_ARTIFACT_BUNDLE_MAX_BYTES)
+    return FileResponse(
+        path=str(target),
+        media_type=str(record.get("mime_type") or mimetypes.guess_type(target.name)[0] or "application/octet-stream"),
+        filename=str(record.get("name") or target.name),
+        content_disposition_type="attachment",
+    )
+
+
+@app.post("/api/artifacts/project-bundle")
+async def create_project_bundle(payload: ArtifactProjectBundleRequest, request: Request):
+    del request
+    return await run_in_threadpool(
+        _create_artifact_project_bundle,
+        payload.project,
+        bool(payload.include_archives),
     )
 
 
@@ -2613,6 +3169,7 @@ async def get_status(profile: Optional[str] = None):
             "restart_drain_timeout": restart_drain_timeout,
             "active_sessions": active_sessions,
             "auth_required": auth_required,
+            "desktop_token_auth": _desktop_token_auth_enabled(),
             "auth_providers": auth_providers,
             "nous_session_valid": nous_session_valid,
         }
@@ -5167,20 +5724,29 @@ def get_model_info(profile: Optional[str] = None):
         # Effective is what the agent actually uses
         effective_ctx = config_ctx_int if config_ctx_int > 0 else auto_ctx
 
-        # Try to get model capabilities from models.dev
+        # Try to get model capabilities from models.dev, then infer common
+        # OpenAI-compatible custom providers from their model id.
         caps = {}
         try:
-            from agent.models_dev import get_model_capabilities
+            from agent.models_dev import get_model_capabilities, infer_model_reasoning_efforts
             mc = get_model_capabilities(provider=provider, model=model_name)
             if mc is not None:
                 caps = {
                     "supports_tools": mc.supports_tools,
                     "supports_vision": mc.supports_vision,
                     "supports_reasoning": mc.supports_reasoning,
+                    "reasoning_efforts": list(mc.reasoning_efforts or ()),
                     "context_window": mc.context_window,
                     "max_output_tokens": mc.max_output_tokens,
                     "model_family": mc.model_family,
                 }
+            if not caps:
+                efforts = list(infer_model_reasoning_efforts(provider, model_name))
+                if efforts:
+                    caps = {
+                        "supports_reasoning": True,
+                        "reasoning_efforts": efforts,
+                    }
         except Exception:
             pass
 
@@ -14009,17 +14575,25 @@ async def get_models_analytics(days: int = 30, profile: Optional[str] = None):
             model_name = row["model"]
             caps = {}
             try:
-                from agent.models_dev import get_model_capabilities
+                from agent.models_dev import get_model_capabilities, infer_model_reasoning_efforts
                 mc = get_model_capabilities(provider=provider, model=model_name)
                 if mc is not None:
                     caps = {
                         "supports_tools": mc.supports_tools,
                         "supports_vision": mc.supports_vision,
                         "supports_reasoning": mc.supports_reasoning,
+                        "reasoning_efforts": list(mc.reasoning_efforts or ()),
                         "context_window": mc.context_window,
                         "max_output_tokens": mc.max_output_tokens,
                         "model_family": mc.model_family,
                     }
+                if not caps:
+                    efforts = list(infer_model_reasoning_efforts(provider, model_name))
+                    if efforts:
+                        caps = {
+                            "supports_reasoning": True,
+                            "reasoning_efforts": efforts,
+                        }
             except Exception:
                 pass
 
@@ -14389,6 +14963,11 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             consume_internal_credential,
             consume_ticket,
         )
+
+        if _desktop_token_auth_enabled():
+            token = ws.query_params.get("token", "")
+            if token and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+                return None, "desktop-token"
 
         # Server-spawned children (PTY child → /api/ws, /api/pub) present the
         # multi-use internal credential rather than a single-use ticket, so

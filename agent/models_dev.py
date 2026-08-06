@@ -397,6 +397,74 @@ def _extract_context(entry: Dict[str, Any]) -> Optional[int]:
 # Model capability metadata
 # ---------------------------------------------------------------------------
 
+_REASONING_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh", "max")
+_DEFAULT_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+
+def _clean_reasoning_efforts(raw: Any) -> Tuple[str, ...]:
+    if isinstance(raw, dict):
+        raw = raw.get("values") or raw.get("enum") or raw.get("options")
+
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        return ()
+
+    seen: set[str] = set()
+    values: list[str] = []
+    for item in items:
+        value = str(item or "").strip().lower()
+        if value == "none":
+            continue
+        if value in _REASONING_EFFORT_ORDER and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return tuple(values)
+
+
+def infer_model_reasoning_efforts(
+    provider: str,
+    model: str,
+    entry: Optional[Dict[str, Any]] = None,
+    *,
+    supports_reasoning: bool = True,
+) -> Tuple[str, ...]:
+    """Infer accepted reasoning effort values for catalog and custom models."""
+    if not supports_reasoning:
+        return ()
+
+    if isinstance(entry, dict):
+        for key in ("reasoning_efforts", "reasoning_effort", "reasoningEfforts"):
+            values = _clean_reasoning_efforts(entry.get(key))
+            if values:
+                return values
+
+    name = (model or "").strip().lower()
+    slug = (provider or "").strip().lower()
+
+    if slug.startswith("z13-qwen"):
+        return ("low", "medium", "high", "max")
+
+    if (
+        name.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4"))
+        or slug in {"openai", "openai-codex"}
+        or "openai" in slug
+        or "subapi" in slug
+    ):
+        return _DEFAULT_REASONING_EFFORTS
+
+    if name.startswith("claude-") or "anthropic" in slug:
+        if any(token in name for token in ("4.7", "4.8", "4-7", "4-8")):
+            return ("low", "medium", "high", "xhigh", "max")
+        return ("low", "medium", "high", "max")
+
+    if name.startswith("grok-") or "xai" in slug:
+        return ("low", "medium", "high")
+
+    return _DEFAULT_REASONING_EFFORTS
+
 
 @dataclass
 class ModelCapabilities:
@@ -405,6 +473,7 @@ class ModelCapabilities:
     supports_tools: bool = True
     supports_vision: bool = False
     supports_reasoning: bool = False
+    reasoning_efforts: Tuple[str, ...] = ()
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
@@ -484,6 +553,12 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     else:
         supports_vision = bool(entry.get("attachment", False))
     supports_reasoning = bool(entry.get("reasoning", False))
+    reasoning_efforts = infer_model_reasoning_efforts(
+        provider,
+        model,
+        entry,
+        supports_reasoning=supports_reasoning,
+    )
 
     # Extract limits
     limit = entry.get("limit", {})
@@ -502,6 +577,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
         supports_tools=supports_tools,
         supports_vision=supports_vision,
         supports_reasoning=supports_reasoning,
+        reasoning_efforts=reasoning_efforts,
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,

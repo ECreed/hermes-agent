@@ -17,7 +17,7 @@ import {
 } from '@/components/ui/pagination'
 import { RowButton } from '@/components/ui/row-button'
 import { Tip } from '@/components/ui/tooltip'
-import { getSessionMessages, listAllProfileSessions } from '@/hermes'
+import { getSessionMessages, listAllProfileSessions, listRegisteredArtifacts } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { ExternalLink, ExternalLinkIcon, hostPathLabel, urlSlugTitleLabel, useLinkTitle } from '@/lib/external-link'
 import { FileImage, FileText, FolderOpen, Link2, Loader2, RefreshCw } from '@/lib/icons'
@@ -40,6 +40,22 @@ import {
   type ArtifactRecord,
   collectArtifactsForSession
 } from './artifact-utils'
+
+function registeredArtifactRecord(artifact: Awaited<ReturnType<typeof listRegisteredArtifacts>>['artifacts'][number]): ArtifactRecord {
+  const value = artifact.path || artifact.download_url || artifact.label
+  const kind = artifact.kind === 'image' ? 'image' : artifact.kind === 'link' ? 'link' : 'file'
+
+  return {
+    id: `registered:${artifact.id}`,
+    kind,
+    value,
+    href: kind === 'link' ? value : `file://${value}`,
+    label: artifact.label || artifact.name || value,
+    sessionId: artifact.session_id || '',
+    sessionTitle: artifact.project ? `Project: ${artifact.project}` : 'Declared artifact',
+    timestamp: Math.round((artifact.created_at || artifact.mtime || Date.now() / 1000) * 1000)
+  }
+}
 
 function formatArtifactTime(timestamp: number): string {
   return fmtDayTime.format(new Date(timestamp))
@@ -133,6 +149,9 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
         const session = sessions[index]
         nextArtifacts.push(...collectArtifactsForSession(session, result.value.messages))
       })
+
+      const registered = await listRegisteredArtifacts(200)
+      nextArtifacts.push(...registered.artifacts.map(registeredArtifactRecord))
 
       setArtifacts(nextArtifacts.sort((left, right) => right.timestamp - left.timestamp))
     } catch (err) {
@@ -596,6 +615,19 @@ function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) 
 }
 
 function SessionCell({ artifact, ctx }: { artifact: ArtifactRecord; ctx: CellCtx }) {
+  if (!artifact.sessionId) {
+    return (
+      <div className="flex h-full w-full min-w-0 items-center px-2.5 py-1.5 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-secondary)">
+        <span className="flex min-w-0 flex-col">
+          <span className="truncate">{artifact.sessionTitle}</span>
+          <span className="truncate text-[0.6875rem] font-normal text-(--ui-text-tertiary)">
+            {formatArtifactTime(artifact.timestamp)}
+          </span>
+        </span>
+      </div>
+    )
+  }
+
   return (
     <ArtifactCellAction onClick={() => ctx.onOpenChat(artifact.sessionId)} title={artifact.sessionTitle}>
       <span className="flex min-w-0 flex-col">

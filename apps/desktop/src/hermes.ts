@@ -81,6 +81,26 @@ const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
 // ever fires when the turn itself would have been abandoned server-side.
 export const PROMPT_SUBMIT_REQUEST_TIMEOUT_MS = 1_800_000
 
+export interface RegisteredArtifactRecord {
+  id: string
+  kind: 'archive' | 'bundle' | 'file' | 'image' | 'link'
+  label: string
+  name: string
+  path: string
+  size: number
+  mtime: number
+  mime_type: string
+  session_id: string | null
+  project: string | null
+  created_at: number
+  metadata?: Record<string, unknown>
+  download_url: string
+}
+
+export interface RegisteredArtifactsResponse {
+  artifacts: RegisteredArtifactRecord[]
+}
+
 export type {
   ActionResponse,
   ActionStatusResponse,
@@ -254,6 +274,14 @@ export async function listAllProfileSessions(
     sessions: result.sessions.slice(0, limit),
     offset: 0
   }
+}
+
+export function listRegisteredArtifacts(limit = 100): Promise<RegisteredArtifactsResponse> {
+  return window.hermesDesktop.api<RegisteredArtifactsResponse>({
+    ...profileScoped(),
+    path: `/api/artifacts?limit=${Math.max(1, Math.min(500, limit))}`,
+    timeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
+  })
 }
 
 // Mutations take the owning `profile` so Electron routes them to that profile's

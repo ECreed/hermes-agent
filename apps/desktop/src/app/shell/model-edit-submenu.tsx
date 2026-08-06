@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
+import { normalizeReasoningEffort, normalizeReasoningEfforts, reasoningEffortLabel } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import { setModelPreset } from '@/store/model-presets'
 import { notifyError } from '@/store/notifications'
@@ -19,14 +20,6 @@ import { $activeSessionId, setCurrentFastMode, setCurrentReasoningEffort } from 
 
 // Hermes' real reasoning levels (see VALID_REASONING_EFFORTS); `none` is owned
 // by the Thinking toggle, not the radio.
-const EFFORT_OPTIONS = [
-  { value: 'minimal', labelKey: 'minimal' },
-  { value: 'low', labelKey: 'low' },
-  { value: 'medium', labelKey: 'medium' },
-  { value: 'high', labelKey: 'high' },
-  { value: 'xhigh', labelKey: 'max' }
-] as const
-
 /** How "fast" is achieved for a given model — two different mechanisms:
  *  - `param`: the Anthropic/OpenAI `speed=fast` request parameter.
  *  - `variant`: a separate `…-fast` sibling model selected via the model field.
@@ -88,6 +81,8 @@ interface ModelEditSubmenuProps {
   provider: string
   /** Whether this model supports reasoning effort. */
   reasoning: boolean
+  /** Server-reported effort values for this model. */
+  reasoningEfforts?: readonly string[]
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }
 
@@ -99,13 +94,15 @@ export function ModelEditSubmenu({
   onSelectModel,
   provider,
   reasoning,
+  reasoningEfforts,
   requestGateway
 }: ModelEditSubmenuProps) {
   const { t } = useI18n()
   const copy = t.shell.modelOptions
   const activeSessionId = useStore($activeSessionId)
 
-  const effortValue = normalizeEffort(effort)
+  const effortOptions = normalizeReasoningEfforts(reasoningEfforts)
+  const effortValue = normalizeEffort(effort, effortOptions)
   const thinkingOn = isThinkingEnabled(effort)
 
   // Editing always records the model's global preset; the active model also gets
@@ -197,7 +194,7 @@ export function ModelEditSubmenu({
               <Switch
                 checked={thinkingOn}
                 className="ml-auto"
-                onCheckedChange={checked => void patchReasoning(checked ? effortValue || 'medium' : 'none')}
+                onCheckedChange={checked => void patchReasoning(checked ? effortValue || effortOptions[0] || 'medium' : 'none')}
                 size="xs"
               />
             </DropdownMenuItem>
@@ -213,14 +210,14 @@ export function ModelEditSubmenu({
               <DropdownMenuSeparator className="mx-0" />
               <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
               <DropdownMenuRadioGroup onValueChange={value => void patchReasoning(value)} value={effortValue}>
-                {EFFORT_OPTIONS.map(option => (
+                {effortOptions.map(value => (
                   <DropdownMenuRadioItem
                     className={dropdownMenuRow}
-                    key={option.value}
+                    key={value}
                     onSelect={event => event.preventDefault()}
-                    value={option.value}
+                    value={value}
                   >
-                    {copy[option.labelKey]}
+                    {reasoningEffortLabel(value)}
                   </DropdownMenuRadioItem>
                 ))}
               </DropdownMenuRadioGroup>
@@ -237,7 +234,7 @@ function isThinkingEnabled(effort: string): boolean {
   return normalize(effort || 'medium') !== 'none'
 }
 
-function normalizeEffort(effort: string): string {
+function normalizeEffort(effort: string, supportedEfforts: readonly string[]): string {
   const value = normalize(effort || 'medium')
 
   // Thinking off → no effort selected in the radio group.
@@ -245,5 +242,7 @@ function normalizeEffort(effort: string): string {
     return ''
   }
 
-  return EFFORT_OPTIONS.some(option => option.value === value) ? value : 'medium'
+  const normalized = normalizeReasoningEffort(value, supportedEfforts)
+
+  return normalized === 'none' ? '' : normalized
 }

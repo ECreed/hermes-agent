@@ -312,6 +312,7 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
                       onSelectModel={nextModel => switchTo(nextModel, group.provider.slug)}
                       provider={group.provider.slug}
                       reasoning={caps?.reasoning ?? true}
+                      reasoningEfforts={caps?.reasoning_efforts}
                       requestGateway={requestGateway}
                     />
                   </DropdownMenuSub>

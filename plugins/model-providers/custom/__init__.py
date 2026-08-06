@@ -11,9 +11,37 @@ Volcengine ARK, vLLM, llama.cpp). Key quirks:
 """
 
 from typing import Any
+from urllib.parse import urlparse
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+
+_LOCAL_OLLAMA_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_LOCAL_OLLAMA_PORTS = {11434, 11435}
+
+
+def _is_local_ollama_qwen_endpoint(ctx: dict[str, Any]) -> bool:
+    base_url = str(ctx.get("base_url") or "").strip()
+    model = str(ctx.get("model") or "").strip().lower()
+    if "qwen" not in model:
+        return False
+    try:
+        parsed = urlparse(base_url)
+    except Exception:
+        return False
+    return (parsed.hostname or "").lower() in _LOCAL_OLLAMA_HOSTS and parsed.port in _LOCAL_OLLAMA_PORTS
+
+
+def _normalise_local_ollama_reasoning_effort(effort: str, ctx: dict[str, Any]) -> str:
+    """Match Ollama's local reasoning enum without changing cloud providers."""
+    if not _is_local_ollama_qwen_endpoint(ctx):
+        return effort
+    if effort == "xhigh":
+        return "max"
+    if effort == "minimal":
+        return "low"
+    return effort
 
 
 class CustomProfile(ProviderProfile):
@@ -51,6 +79,7 @@ class CustomProfile(ProviderProfile):
         # recognize it. Mirrors the DeepSeek/Zai profile precedent.
         if reasoning_config and isinstance(reasoning_config, dict):
             _effort = (reasoning_config.get("effort") or "").strip().lower()
+            _effort = _normalise_local_ollama_reasoning_effort(_effort, ctx)
             _enabled = reasoning_config.get("enabled", True)
             if _effort == "none" or _enabled is False:
                 extra_body["think"] = False
