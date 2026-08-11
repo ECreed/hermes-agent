@@ -1390,7 +1390,7 @@ def _is_sensitive_path(path: Path) -> bool:
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
 
 
-_FS_DATA_URL_MAX_BYTES = 16 * 1024 * 1024
+_FS_DATA_URL_MAX_BYTES = 100 * 1024 * 1024
 _FS_TEXT_SOURCE_MAX_BYTES = 64 * 1024 * 1024
 _FS_TEXT_PREVIEW_MAX_BYTES = 512 * 1024
 # Upper bound for the in-app spot editor's save. The editor only opens
@@ -1831,7 +1831,7 @@ _ARTIFACT_EXCLUDED_DIR_NAMES = _SENSITIVE_MANAGED_DIR_NAMES | frozenset({
     "venv",
 })
 _ARTIFACT_KIND_VALUES = frozenset({"archive", "bundle", "file", "image", "link"})
-_ARTIFACT_TEXT_SCAN_MAX_BYTES = 16 * 1024 * 1024
+_ARTIFACT_TEXT_SCAN_MAX_BYTES = 100 * 1024 * 1024
 _ARTIFACT_TEXT_SUFFIXES = frozenset({
     ".cfg",
     ".conf",
@@ -17789,6 +17789,12 @@ def start_server(
         # reaped via the WebSocketDisconnect → disconnect/reap path.
         ws_ping_interval=None if _is_loopback else 20.0,
         ws_ping_timeout=None if _is_loopback else 20.0,
+        # Raised from uvicorn's 16 MiB default: desktop/dashboard uploads of
+        # large files ride the WebSocket as base64 data_urls in the
+        # file.attach / image.attach_bytes RPCs (base64 inflates ~33%, so a
+        # 100 MB file is a ~133 MB frame), and the stock cap was silently
+        # killing any non-trivial attachment with a dropped connection.
+        ws_max_size=100 * 1024 * 1024,
     )
     server = uvicorn.Server(config)
 
