@@ -34,6 +34,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_task_model_selection,
     _inherit_parent_base_url,
 )
 
@@ -71,6 +72,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("model", props)
+        self.assertIn("model", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -199,6 +202,72 @@ class TestStripBlockedTools(unittest.TestCase):
                     f"Toolset {name!r} (tools={tools}) is fully blocked "
                     f"but was not stripped",
                 )
+
+
+class TestConfiguredTaskModelSelection(unittest.TestCase):
+    def setUp(self):
+        self.parent = _make_mock_parent()
+        self.full_config = {
+            "providers": {
+                "subapi": {
+                    "base_url": "http://127.0.0.1:18080/v1",
+                    "key_env": "SUBAPI_ZELLM_API_KEY",
+                    "api_mode": "chat_completions",
+                    "models": ["gpt-5.6-sol", "shared-model"],
+                },
+                "opencode-go": {
+                    "base_url": "https://opencode.ai/zen/go/v1",
+                    "key_env": "OPENCODE_GO_API_KEY",
+                    "api_mode": "chat_completions",
+                    "models": ["deepseek-v4-flash", "shared-model"],
+                },
+            }
+        }
+
+    @patch("hermes_cli.config.load_config_readonly")
+    def test_omitted_model_inherits_parent(self, mock_load):
+        mock_load.return_value = self.full_config
+        resolved = _resolve_task_model_selection(None, self.parent)
+        self.assertIsNone(resolved["model"])
+        self.assertIsNone(resolved["provider"])
+
+    @patch("hermes_cli.config.load_config_readonly")
+    def test_explicit_inherit_inherits_parent(self, mock_load):
+        mock_load.return_value = self.full_config
+        resolved = _resolve_task_model_selection("inherit", self.parent)
+        self.assertIsNone(resolved["model"])
+        self.assertIsNone(resolved["provider"])
+
+    @patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"})
+    @patch("hermes_cli.config.load_config_readonly")
+    def test_unique_short_model_resolves_configured_provider(self, mock_load):
+        mock_load.return_value = self.full_config
+        resolved = _resolve_task_model_selection("deepseek-v4-flash", self.parent)
+        self.assertEqual(resolved["model"], "deepseek-v4-flash")
+        self.assertEqual(resolved["provider"], "opencode-go")
+        self.assertEqual(resolved["api_key"], "test-key")
+
+    @patch.dict(os.environ, {"OPENCODE_GO_API_KEY": "test-key"})
+    @patch("hermes_cli.config.load_config_readonly")
+    def test_provider_qualified_model_resolves(self, mock_load):
+        mock_load.return_value = self.full_config
+        resolved = _resolve_task_model_selection(
+            "opencode-go/deepseek-v4-flash", self.parent
+        )
+        self.assertEqual(resolved["model"], "deepseek-v4-flash")
+        self.assertEqual(resolved["provider"], "opencode-go")
+
+    @patch("hermes_cli.config.load_config_readonly")
+    def test_unknown_model_is_rejected(self, mock_load):
+        mock_load.return_value = self.full_config
+        with self.assertRaisesRegex(ValueError, "not configured"):
+            _resolve_task_model_selection("made-up-model", self.parent)
+
+    @patch("hermes_cli.config.load_config_readonly")
+    def test_ambiguous_short_model_requires_provider(self, mock_load):
+        mock_load.return_value = self.full_config
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            _resolve_task_model_selection("shared-model", self.parent)
 
 
 class TestDelegateTask(unittest.TestCase):

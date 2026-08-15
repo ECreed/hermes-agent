@@ -131,7 +131,29 @@ Single-task delegation runs directly without thread pool overhead.
 
 ## Model Override
 
-You can configure a different model for subagents via `config.yaml` — useful for delegating simple tasks to cheaper/faster models:
+By default, subagents inherit the parent model. You can deliberately route a
+single child—or each item in a batch—to another model already configured in
+`config.yaml`:
+
+```python
+delegate_task(
+    goal="Independently challenge this design",
+    model="opencode-go/deepseek-v4-flash",
+)
+
+delegate_task(tasks=[
+    {"goal": "Primary analysis"},  # inherits the parent
+    {"goal": "Find blind spots", "model": "opencode-go/deepseek-v4-flash"},
+    {"goal": "Adjudicate disagreements", "model": "subapi/gpt-5.6-sol"},
+])
+```
+
+A unique configured model ID can be used without the provider prefix. If the
+same model appears under multiple providers, use `provider/model`. Unknown or
+unconfigured models are rejected; tool calls cannot supply arbitrary API keys
+or base URLs. Results include the actual `provider` and `model` used.
+
+You can still pin all subagents install-wide via `config.yaml`:
 
 ```yaml
 # In ~/.hermes/config.yaml
@@ -140,7 +162,8 @@ delegation:
   provider: "openrouter"              # Optional: route subagents to a different provider
 ```
 
-If omitted, subagents use the same model as the parent.
+Per-task `model` overrides this install-wide pin. If neither is set, subagents
+use the same model as the parent.
 
 ## Toolset Selection Tips
 

@@ -2112,6 +2112,11 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "provider": (
+                getattr(child, "provider", None)
+                if isinstance(getattr(child, "provider", None), str)
+                else None
+            ),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2343,6 +2348,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    model: Optional[str] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
@@ -2446,7 +2452,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "model": model,
+        }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2485,6 +2496,14 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            task_model = t.get("model")
+            if task_model:
+                try:
+                    task_creds = _resolve_task_model_selection(task_model, parent_agent)
+                except ValueError as exc:
+                    return tool_error(f"Task {i}: {exc}")
+            else:
+                task_creds = creds
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2492,16 +2511,16 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -3119,6 +3138,124 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+def _load_full_config() -> dict:
+    """Load the active profile config without exposing or mutating it."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        full = load_config_readonly()
+        return full if isinstance(full, dict) else {}
+    except Exception:
+        try:
+            from cli import CLI_CONFIG
+            return CLI_CONFIG if isinstance(CLI_CONFIG, dict) else {}
+        except Exception:
+            return {}
+
+
+def _configured_model_pairs(full_config: dict) -> Dict[str, List[str]]:
+    """Return provider -> explicitly configured model IDs."""
+    pairs: Dict[str, List[str]] = {}
+    providers = full_config.get("providers") or {}
+    if isinstance(providers, dict):
+        for provider, definition in providers.items():
+            if not isinstance(definition, dict):
+                continue
+            models = definition.get("models") or []
+            if isinstance(models, str):
+                models = [models]
+            for model_id in models:
+                model_id = str(model_id or "").strip()
+                if model_id and model_id not in pairs.setdefault(str(provider), []):
+                    pairs[str(provider)].append(model_id)
+
+    def _add_selected(block: Any) -> None:
+        if not isinstance(block, dict):
+            return
+        provider = str(block.get("provider") or "").strip()
+        model_id = str(block.get("model") or block.get("default") or "").strip()
+        if provider and model_id and model_id not in pairs.setdefault(provider, []):
+            pairs[provider].append(model_id)
+
+    _add_selected(full_config.get("model"))
+    auxiliary = full_config.get("auxiliary") or {}
+    if isinstance(auxiliary, dict):
+        for block in auxiliary.values():
+            _add_selected(block)
+    return pairs
+
+
+def _resolve_task_model_selection(selection: Optional[str], parent_agent) -> dict:
+    """Resolve a per-task selection against configured provider/model pairs."""
+    raw = str(selection or "").strip()
+    if not raw or raw.lower() == "inherit":
+        return {"model": None, "provider": None, "base_url": None,
+                "api_key": None, "api_mode": None}
+
+    full = _load_full_config()
+    pairs = _configured_model_pairs(full)
+    requested_provider: Optional[str] = None
+    requested_model = raw
+    exact_matches = [p for p, models in pairs.items() if raw in models]
+    if not exact_matches and "/" in raw:
+        prefix, suffix = raw.split("/", 1)
+        if prefix in pairs and suffix in pairs[prefix]:
+            requested_provider, requested_model = prefix, suffix
+    elif len(exact_matches) == 1:
+        requested_provider = exact_matches[0]
+    elif len(exact_matches) > 1:
+        choices = ", ".join(f"{p}/{raw}" for p in exact_matches)
+        raise ValueError(
+            f"Configured model '{raw}' is ambiguous; specify provider/model: {choices}."
+        )
+
+    if requested_provider is None:
+        available = sorted(f"{p}/{m}" for p, models in pairs.items() for m in models)
+        raise ValueError(
+            f"Model '{raw}' is not configured for delegation. Available configured "
+            f"models: {', '.join(available) or '<none>'}."
+        )
+
+    provider_cfg = (full.get("providers") or {}).get(requested_provider) or {}
+    if isinstance(provider_cfg, dict) and provider_cfg:
+        base_url = str(provider_cfg.get("base_url") or "").strip() or None
+        api_mode = str(provider_cfg.get("api_mode") or "chat_completions").strip()
+        key_env = str(provider_cfg.get("key_env") or "").strip()
+        api_key = os.getenv(key_env, "") if key_env else ""
+        if base_url and api_key:
+            return {"model": requested_model, "provider": requested_provider,
+                    "base_url": base_url, "api_key": api_key,
+                    "api_mode": api_mode}
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        runtime = resolve_runtime_provider(
+            requested=requested_provider, target_model=requested_model
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Configured model '{requested_provider}/{requested_model}' could not "
+            f"resolve provider credentials: {exc}"
+        ) from exc
+
+    api_key = runtime.get("api_key") or ""
+    if not api_key:
+        raise ValueError(
+            f"Configured model '{requested_provider}/{requested_model}' has no "
+            "available credential. Configure its provider key or auth pool first."
+        )
+    return {
+        "model": requested_model,
+        "provider": (requested_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+                     else runtime.get("provider") or requested_provider),
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+    }
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -3260,7 +3397,11 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model defaults to inheriting the parent (or the install-wide "
+        "delegation.provider/model pin). For deliberate cross-family review, pass "
+        "model on a single task or per task in a batch. Only models already "
+        "configured in config.yaml are accepted; use provider/model if a short "
+        "model name is ambiguous.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3374,6 +3515,14 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional configured model for this child. Omit or use "
+                    "'inherit' to inherit the parent. Use a unique configured "
+                    "model ID, or provider/model when names are ambiguous."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3383,6 +3532,13 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional configured model for this task; omitted "
+                                "means inherit the parent/default delegation model."
+                            ),
                         },
                         "role": {
                             "type": "string",
@@ -3470,6 +3626,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        model=args.get("model"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

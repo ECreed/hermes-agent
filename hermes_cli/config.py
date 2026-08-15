@@ -1939,6 +1939,10 @@ DEFAULT_CONFIG = {
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
+        # Maximum size of one streamed upload/download from the Files page.
+        # Preview/edit endpoints keep their smaller in-memory limits; this
+        # setting applies only to disk-streamed transfers. Clamped to 1-64 GiB.
+        "max_file_transfer_gb": 8,
         # Hide the token/cost analytics surfaces (Analytics page, token bars and
         # cost figures on the Models page) by default.  The numbers shown there
         # are a local debug estimate: they only count successful main-agent

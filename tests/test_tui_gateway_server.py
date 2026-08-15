@@ -4260,6 +4260,44 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         server._sessions.pop("sid", None)
 
 
+def test_prepare_session_attachment_upload_targets_live_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server._sessions["stream-sid"] = _session(cwd=str(workspace))
+
+    try:
+        target, max_bytes = server.prepare_session_attachment_upload(
+            "stream-sid", "large report.bin", "file"
+        )
+
+        assert target.parent == workspace / ".hermes" / "desktop-attachments"
+        assert target.name == "large report.bin"
+        assert max_bytes is None
+    finally:
+        server._sessions.pop("stream-sid", None)
+
+
+def test_prepare_session_image_upload_keeps_image_cap(monkeypatch, tmp_path):
+    _attach_bytes_cli(monkeypatch)
+    monkeypatch.setattr(server, "_hermes_home", tmp_path / "hermes")
+    server._sessions["stream-image"] = _session(cwd=str(tmp_path))
+
+    try:
+        target, max_bytes = server.prepare_session_attachment_upload(
+            "stream-image", "photo.png", "image"
+        )
+
+        assert target.parent == tmp_path / "hermes" / "images"
+        assert max_bytes == server._ATTACH_BYTES_MAX_BYTES
+    finally:
+        server._sessions.pop("stream-image", None)
+
+
+def test_prepare_session_attachment_upload_rejects_unknown_session(tmp_path):
+    with pytest.raises(KeyError, match="session not found"):
+        server.prepare_session_attachment_upload("missing", "report.bin", "file")
+
+
 def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, tmp_path):
     """Local case: gateway can see the file but it's outside the workspace → copy in."""
     workspace = tmp_path / "workspace"

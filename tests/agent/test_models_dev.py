@@ -6,6 +6,7 @@ from agent.models_dev import (
     _extract_context,
     fetch_models_dev,
     get_model_capabilities,
+    infer_model_reasoning_efforts,
     lookup_models_dev_context,
 )
 
@@ -92,6 +93,10 @@ class TestProviderMapping:
     def test_openai_codex_mapped_to_openai(self):
         assert PROVIDER_TO_MODELS_DEV["openai"] == "openai"
         assert PROVIDER_TO_MODELS_DEV["openai-codex"] == "openai"
+
+    def test_subapi_gpt_models_expose_max_reasoning_effort(self):
+        efforts = infer_model_reasoning_efforts("subapi", "gpt-5.6-sol")
+        assert efforts == ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 class TestExtractContext:

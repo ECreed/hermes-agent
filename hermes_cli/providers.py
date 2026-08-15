@@ -395,7 +395,29 @@ def normalize_provider(name: str) -> str:
     corresponds to a known provider.
     """
     key = name.strip().lower()
-    return ALIASES.get(key, key)
+    canonical = ALIASES.get(key)
+    if canonical is not None:
+        return canonical
+
+    # A canonical core ID must stay canonical even if a plugin also declares
+    # it as an alias (for example, opencode-zen aliases "opencode").
+    if key in ALIASES.values() or key in HERMES_OVERLAYS:
+        return key
+
+    # Model-provider plugins can declare aliases that are not part of this
+    # module's legacy alias table. Keep discovery lazy and fail open so a
+    # broken optional plugin cannot prevent an otherwise valid provider name
+    # from reaching user-config resolution.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(key)
+        if profile is not None:
+            return profile.name
+    except Exception:
+        pass
+
+    return key
 
 
 def get_provider(name: str) -> Optional[ProviderDef]:

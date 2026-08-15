@@ -34,7 +34,7 @@ export interface JsonRpcFrame {
   error?: { message?: string }
   id?: GatewayRequestId | null
   method?: string
-  params?: GatewayEvent
+  params?: GatewayEvent | Record<string, unknown>
   result?: unknown
 }
 
@@ -335,8 +335,15 @@ export class JsonRpcGatewayClient {
       return
     }
 
-    if (frame.method === 'event' && frame.params?.type) {
-      this.dispatchEvent(frame.params)
+    if (frame.method === 'event') {
+      const params = frame.params
+      if (
+        params &&
+        typeof params === 'object' &&
+        typeof (params as Record<string, unknown>).type === 'string'
+      ) {
+        this.dispatchEvent(params as unknown as GatewayEvent)
+      }
     }
   }
 

@@ -79,23 +79,43 @@ export async function uploadComposerAttachment(
     let result: ImageAttachResponse
 
     if (remote) {
-      let payload: Awaited<ReturnType<typeof readImageForRemoteAttach>>
+      const streamUpload = window.hermesDesktop?.uploadAttachment
 
-      try {
-        payload = await readImageForRemoteAttach(path)
-      } catch (err) {
-        throw friendlyRemoteAttachError(err, label)
+      if (streamUpload) {
+        try {
+          const staged = await streamUpload({
+            filePath: path,
+            kind: 'image',
+            name: label,
+            profile: $connection.get()?.profile,
+            sessionId
+          })
+          result = await requestGateway<ImageAttachResponse>('image.attach', {
+            path: staged.path,
+            session_id: sessionId
+          })
+        } catch (err) {
+          throw friendlyRemoteAttachError(err, label)
+        }
+      } else {
+        let payload: Awaited<ReturnType<typeof readImageForRemoteAttach>>
+
+        try {
+          payload = await readImageForRemoteAttach(path)
+        } catch (err) {
+          throw friendlyRemoteAttachError(err, label)
+        }
+
+        if (!payload) {
+          throw new Error(`Could not read ${label}`)
+        }
+
+        result = await requestGateway<ImageAttachResponse>('image.attach_bytes', {
+          session_id: sessionId,
+          content_base64: payload.contentBase64,
+          filename: payload.filename
+        })
       }
-
-      if (!payload) {
-        throw new Error(`Could not read ${label}`)
-      }
-
-      result = await requestGateway<ImageAttachResponse>('image.attach_bytes', {
-        session_id: sessionId,
-        content_base64: payload.contentBase64,
-        filename: payload.filename
-      })
     } else {
       result = await requestGateway<ImageAttachResponse>('image.attach', {
         path,
@@ -120,22 +140,40 @@ export async function uploadComposerAttachment(
 
   // Non-image file.
   let dataUrl: string | null = null
+  let gatewayPath = path
 
   if (remote) {
-    try {
-      dataUrl = await readFileDataUrlForAttach(path)
-    } catch (err) {
-      throw friendlyRemoteAttachError(err, label)
-    }
+    const streamUpload = window.hermesDesktop?.uploadAttachment
 
-    if (!dataUrl) {
-      throw new Error(`Could not read ${label}`)
+    if (streamUpload) {
+      try {
+        const staged = await streamUpload({
+          filePath: path,
+          kind: 'file',
+          name: label,
+          profile: $connection.get()?.profile,
+          sessionId
+        })
+        gatewayPath = staged.path
+      } catch (err) {
+        throw friendlyRemoteAttachError(err, label)
+      }
+    } else {
+      try {
+        dataUrl = await readFileDataUrlForAttach(path)
+      } catch (err) {
+        throw friendlyRemoteAttachError(err, label)
+      }
+
+      if (!dataUrl) {
+        throw new Error(`Could not read ${label}`)
+      }
     }
   }
 
   const result = await requestGateway<FileAttachResponse>('file.attach', {
     name: label,
-    path,
+    path: gatewayPath,
     session_id: sessionId,
     ...(dataUrl ? { data_url: dataUrl } : {})
   })

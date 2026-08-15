@@ -3943,8 +3943,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP Python SDK 2.0 renamed protocol aliases to snake_case
+            # (isError -> is_error). Keep older SDK / test-double support.
+            is_error = getattr(result, "is_error", None)
+            if is_error is None:
+                is_error = getattr(result, "isError", False)
+            if is_error:
                 error_text = ""
                 for block in (result.content or []):
                     if hasattr(block, "text"):
@@ -3980,7 +3984,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # MCP spec: content is model-oriented (text), structuredContent
             # is machine-oriented (JSON metadata).  For an AI agent, content
             # is the primary payload; structuredContent supplements it.
-            structured = getattr(result, "structuredContent", None)
+            structured = getattr(result, "structured_content", None)
+            if structured is None:
+                structured = getattr(result, "structuredContent", None)
             if structured is not None:
                 if text_result:
                     return json.dumps({
@@ -3995,15 +4001,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # A completed tools/call proves the transport is healthy. MCP
+            # application errors (validation, missing arguments, domain
+            # failures) belong to the tool, not the server circuit breaker.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()

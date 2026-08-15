@@ -427,6 +427,12 @@ async def handle_ws(ws: Any) -> None:
         detached_sessions = 0
         if transport is not None:
             transport.close()
+            try:
+                from tools.computer_use.remote import unregister_transport
+
+                unregister_transport(transport)
+            except Exception:
+                pass
 
             # Reap sessions this transport owned (close_on_disconnect sidecar
             # sessions) or detach the rest to the drop sentinel so later emits

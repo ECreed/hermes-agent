@@ -146,6 +146,25 @@ describe('downloadGatewayMediaFile', () => {
     expect(clickSpy).toHaveBeenCalledOnce()
   })
 
+  it('uses the native streaming download bridge when available', async () => {
+    const downloadGatewayFile = vi.fn(async () => ({ canceled: false, path: 'C:\\Downloads\\report.md' }))
+    vi.stubGlobal('window', {
+      hermesDesktop: { api, downloadGatewayFile },
+      setTimeout: vi.fn()
+    })
+    $connection.set({ mode: 'remote', profile: 'subapi' } as never)
+
+    await downloadGatewayMediaFile('file:///Users/me/project/report.md')
+
+    expect(downloadGatewayFile).toHaveBeenCalledWith({
+      name: 'report.md',
+      path: '/Users/me/project/report.md',
+      profile: 'subapi'
+    })
+    expect(api).not.toHaveBeenCalled()
+    expect(clickSpy).not.toHaveBeenCalled()
+  })
+
   it('rejects when the gateway refuses the file read', async () => {
     api.mockRejectedValueOnce(new Error('403 File is not readable'))
 

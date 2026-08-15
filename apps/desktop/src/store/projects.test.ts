@@ -11,6 +11,7 @@ import {
   createProject,
   enterProject,
   exitProjectScope,
+  exitProjectToSessions,
   openProjectCreate,
   pickProjectFolder,
   refreshProjects,
@@ -68,6 +69,18 @@ describe('project scope', () => {
     enterProject('p_123')
     exitProjectScope()
     expect($projectScope.get()).toBe(ALL_PROJECTS)
+  })
+
+  it('exitProjectToSessions returns to the flat historical-session list', () => {
+    $sidebarAgentsGrouped.set(true)
+    enterProject('p_123')
+
+    exitProjectToSessions()
+
+    expect($projectScope.get()).toBe(ALL_PROJECTS)
+    expect($sidebarAgentsGrouped.get()).toBe(false)
+    expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe(ALL_PROJECTS)
+    expect(window.localStorage.getItem('hermes.desktop.agentsGroupedByWorkspace')).toBe('false')
   })
 
   it('entering the synthetic No-project bucket still scopes (no active pin)', () => {

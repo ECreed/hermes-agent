@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { api, buildArtifactDownloadHref } from "./api";
+import {
+  api,
+  buildArtifactDownloadHref,
+  buildManagedFileDownloadHref,
+} from "./api";
 
 const SESSION_HEADER = "X-Hermes-Session-Token";
 
@@ -58,6 +62,25 @@ describe("authenticated downloads", () => {
     expect(href).toBe("/api/artifacts/download?id=artifact+id");
     expect(href).not.toContain("unit-test-session-token");
     expect(href).not.toContain("token=");
+  });
+
+  it("uses a scoped ticket URL for browser-native file streaming", async () => {
+    vi.stubGlobal("window", { __HERMES_SESSION_TOKEN__: "unit-test-session-token" });
+    const fetchMock = jsonFetchMock({ ticket: "scoped file ticket", ttl_seconds: 900 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await api.createFileDownloadTicket("/tmp/large backup.zip");
+    const href = buildManagedFileDownloadHref(result.ticket);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/files/download-ticket",
+      expect.objectContaining({
+        body: JSON.stringify({ path: "/tmp/large backup.zip" }),
+        method: "POST",
+      }),
+    );
+    expect(href).toBe("/api/files/download-transfer?ticket=scoped+file+ticket");
+    expect(href).not.toContain("unit-test-session-token");
   });
 
   it("sends download credentials in a header instead of the URL", async () => {

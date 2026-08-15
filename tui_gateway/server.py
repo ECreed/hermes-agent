@@ -1220,6 +1220,56 @@ def method(name: str):
     return dec
 
 
+@method("device.register")
+def _(rid, params: dict) -> dict:
+    """Register the current authenticated WS as a desktop execution endpoint."""
+    from tools.computer_use.remote import register_device
+
+    transport = current_transport()
+    if transport is None:
+        return _err(rid, 4004, "device.register requires a live transport")
+    raw_proof = str(params.get("proof") or "").strip()
+    if not raw_proof:
+        return _err(rid, 4004, "device proof is required")
+    try:
+        device = register_device(
+            params.get("endpoint_id", ""),
+            transport,
+            alias=params.get("alias", ""),
+            platform=params.get("platform", ""),
+            capabilities=params.get("capabilities") or (),
+            proof=raw_proof,
+        )
+    except ValueError as exc:
+        return _err(rid, 4004, str(exc))
+    return _ok(rid, {"endpoint_id": device.endpoint_id, "registered": True})
+
+
+@method("device.respond")
+def _(rid, params: dict) -> dict:
+    """Resolve one pending backend→desktop execution request."""
+    from tools.computer_use.remote import resolve_device_response
+
+    accepted = resolve_device_response(
+        params.get("endpoint_id", ""),
+        params.get("request_id", ""),
+        {
+            "ok": bool(params.get("ok")),
+            "result": params.get("result"),
+            "error": params.get("error"),
+        },
+        transport=current_transport(),
+    )
+    return _ok(rid, {"accepted": accepted})
+
+
+@method("device.list")
+def _(rid, params: dict) -> dict:
+    from tools.computer_use.remote import list_devices
+
+    return _ok(rid, {"devices": list_devices()})
+
+
 def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     """Validate a JSON-RPC request enough for safe local dispatch."""
     if not isinstance(req, dict):
@@ -3310,7 +3360,9 @@ def _current_profile_name() -> str:
 # checkout), surfacing a one-click "update to align" prompt instead of failing
 # cryptically downstream. Bump whenever the desktop's backend contract changes.
 # v2: adds the file.attach RPC (remote-gateway non-image file upload).
-DESKTOP_BACKEND_CONTRACT = 2
+# v3: adds authenticated HTTP streaming for remote desktop attachments.
+# v4: adds Desktop endpoint registration and remote computer-use execution.
+DESKTOP_BACKEND_CONTRACT = 4
 
 
 def _session_info(agent, session: dict | None = None) -> dict:
@@ -5044,7 +5096,12 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(
+    session: dict,
+    text: Any,
+    transport: Any,
+    origin_endpoint_id: str = "",
+) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -5058,13 +5115,26 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
         existing
         and isinstance(existing.get("text"), str)
         and isinstance(text, str)
+        and existing.get("transport") is transport
+        and str(existing.get("origin_endpoint_id") or "") == str(origin_endpoint_id or "")
     ):
         prev = existing["text"]
         text = f"{prev}\n\n{text}" if prev and text else (prev or text)
-    session["queued_prompt"] = {"text": text, "transport": transport}
+    session["queued_prompt"] = {
+        "text": text,
+        "transport": transport,
+        "origin_endpoint_id": origin_endpoint_id,
+    }
 
 
-def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any) -> dict:
+def _handle_busy_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    origin_endpoint_id: str = "",
+) -> dict:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
 
@@ -5081,6 +5151,12 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     """
     mode = _load_busy_input_mode()
     agent = session.get("agent")
+    existing = session.get("queued_prompt")
+    if existing and (
+        existing.get("transport") is not transport
+        or str(existing.get("origin_endpoint_id") or "") != str(origin_endpoint_id or "")
+    ):
+        return _err(rid, 4009, "a prompt from another Desktop endpoint is already queued")
     if mode == "steer" and agent is not None and hasattr(agent, "steer"):
         try:
             if agent.steer(text):
@@ -5093,7 +5169,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             agent.interrupt()
         except Exception:
             pass
-    _enqueue_prompt(session, text, transport)
+    _enqueue_prompt(session, text, transport, origin_endpoint_id)
     session["last_active"] = time.time()
     return _ok(rid, {"status": "queued"})
 
@@ -5114,7 +5190,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     try:
-        _run_prompt_submit(rid, sid, session, queued["text"])
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            queued["text"],
+            origin_endpoint_id=str(queued.get("origin_endpoint_id") or ""),
+        )
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "
@@ -8413,16 +8495,34 @@ def _(rid, params: dict) -> dict:
         return err
     # Re-bind to the current client transport for this request. This keeps
     # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # or fallback moved the session transport to stdio. The same authenticated
+    # transport owns the Desktop endpoint registration, so snapshot the origin
+    # for THIS turn here instead of permanently binding the durable session.
+    turn_origin_endpoint_id = ""
+    t = current_transport()
+    if t is not None:
+        try:
+            from tools.computer_use.remote import endpoint_for_transport
+
+            turn_origin_endpoint_id = endpoint_for_transport(t)
+        except Exception:
+            turn_origin_endpoint_id = ""
     with session["history_lock"]:
         if session.get("running"):
             # Don't reject a mid-turn prompt — queue it (and, by default,
             # interrupt the live turn) so it runs as the next turn. See
             # _handle_busy_submit for why the old "session busy" rejection
             # dropped messages when teardown outlived the client's retry window.
-            return _handle_busy_submit(rid, sid, session, text, t or session.get("transport"))
+            return _handle_busy_submit(
+                rid,
+                sid,
+                session,
+                text,
+                t or session.get("transport"),
+                turn_origin_endpoint_id,
+            )
+        if t is not None:
+            session["transport"] = t
         # A watch session's run lives in the PARENT turn, so its own running
         # flag is False — without this, typing mid-run builds a second agent
         # racing the in-flight child on the same stored session (interleaved
@@ -8485,7 +8585,13 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 _clear_inflight_turn(session)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            origin_endpoint_id=turn_origin_endpoint_id,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -8873,7 +8979,14 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    origin_endpoint_id: str = "",
+) -> None:
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -8891,6 +9004,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
     def run():
         approval_token = None
+        device_context_tokens = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
@@ -8901,6 +9015,21 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
 
             approval_token = set_current_session_key(session["session_key"])
+            from tools.approval import (
+                _YOLO_MODE_FROZEN,
+                _get_approval_mode,
+                is_session_yolo_enabled,
+            )
+            from tools.computer_use.remote import set_turn_device_context
+
+            device_context_tokens = set_turn_device_context(
+                origin_endpoint_id=origin_endpoint_id,
+                yolo=(
+                    bool(_YOLO_MODE_FROZEN)
+                    or _get_approval_mode() == "off"
+                    or is_session_yolo_enabled(session["session_key"])
+                ),
+            )
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
@@ -9286,6 +9415,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
             _emit("error", sid, {"message": str(e)})
         finally:
+            try:
+                if device_context_tokens is not None:
+                    from tools.computer_use.remote import reset_turn_device_context
+
+                    reset_turn_device_context(device_context_tokens)
+            except Exception:
+                pass
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -9792,6 +9928,47 @@ def _unique_attachment_path(root: Path, filename: str) -> Path:
         if not next_candidate.exists():
             return next_candidate
         counter += 1
+
+
+def prepare_session_attachment_upload(
+    session_id: str,
+    filename: str,
+    kind: str = "file",
+) -> tuple[Path, int | None]:
+    """Reserve a gateway-local destination for an HTTP-streamed attachment.
+
+    The dashboard HTTP server and the JSON-RPC gateway share this process. The
+    HTTP route calls this helper after authenticating the desktop request so it
+    can stream directly into the live session workspace instead of sending a
+    base64 copy through the WebSocket. The subsequent ``file.attach`` or
+    ``image.attach`` RPC only has to register the returned gateway-local path.
+
+    Returns ``(target, max_bytes)``. Images retain the existing model-facing
+    25 MiB cap; ordinary files use the dashboard's configurable transfer cap.
+    """
+    sid = str(session_id or "").strip()
+    upload_kind = str(kind or "file").strip().lower()
+    if upload_kind not in {"file", "image"}:
+        raise ValueError("kind must be file or image")
+
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            raise KeyError("session not found")
+
+        safe_name = _sanitize_attachment_name(filename)
+        if upload_kind == "image":
+            suffix = Path(safe_name).suffix.lower()
+            if suffix not in _allowed_image_extensions():
+                raise ValueError(f"unsupported image extension: {suffix or '(none)'}")
+            root = _hermes_home / "images"
+            max_bytes: int | None = _ATTACH_BYTES_MAX_BYTES
+        else:
+            root = _desktop_attachment_dir(session)
+            max_bytes = None
+
+        root.mkdir(parents=True, exist_ok=True)
+        return _unique_attachment_path(root, safe_name).resolve(), max_bytes
 
 
 def _resolve_gateway_attachment_path(raw: str) -> Path | None:

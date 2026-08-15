@@ -196,6 +196,57 @@ export class HermesGateway extends JsonRpcGatewayClient {
       notConnectedErrorMessage: 'Hermes gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
     })
+
+    // Device control is socket-local. Register and respond through THIS gateway
+    // instance so background-profile sockets cannot accidentally reply through
+    // whichever profile happens to be active in the UI.
+    this.on('gateway.ready', () => {
+      const device = window.hermesDesktop?.device
+      if (!device) return
+      void device
+        .getIdentity()
+        .then(identity =>
+          this.request('device.register', {
+            endpoint_id: identity.endpointId,
+            proof: identity.proof,
+            alias: identity.alias,
+            platform: identity.platform,
+            capabilities: ['computer_use']
+          })
+        )
+        .catch(() => undefined)
+    })
+
+    this.on<{ request_id?: string; endpoint_id?: string; method?: string; args?: unknown }>(
+      'device.request',
+      event => {
+        const payload = event.payload
+        const device = window.hermesDesktop?.device
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
+        const endpointId = typeof payload?.endpoint_id === 'string' ? payload.endpoint_id : ''
+        const args = payload?.args && typeof payload.args === 'object' ? payload.args : {}
+
+        if (!device || !requestId || !endpointId || payload?.method !== 'computer_use') return
+        void device
+          .executeComputerUse(args as Record<string, unknown>)
+          .then(result =>
+            this.request('device.respond', {
+              endpoint_id: endpointId,
+              request_id: requestId,
+              ok: true,
+              result
+            })
+          )
+          .catch(error =>
+            this.request('device.respond', {
+              endpoint_id: endpointId,
+              request_id: requestId,
+              ok: false,
+              error: error instanceof Error ? error.message : String(error)
+            })
+          )
+      }
+    )
   }
 }
 

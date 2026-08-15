@@ -32,10 +32,20 @@ def _make_mcp_tool(name="read_file", description="Read a file", input_schema=Non
     return tool
 
 
-def _make_call_result(text="file contents here", is_error=False):
-    """Create a fake MCP CallToolResult."""
+def _make_call_result(text="file contents here", is_error=False, *, sdk_v2=False, structured=None):
+    """Create a fake MCP CallToolResult for legacy or SDK 2.0 field names."""
     block = SimpleNamespace(text=text)
-    return SimpleNamespace(content=[block], isError=is_error)
+    if sdk_v2:
+        return SimpleNamespace(
+            content=[block],
+            is_error=is_error,
+            structured_content=structured,
+        )
+    return SimpleNamespace(
+        content=[block],
+        isError=is_error,
+        structuredContent=structured,
+    )
 
 
 def _make_mock_server(name, session=None, tools=None):
@@ -754,6 +764,76 @@ class TestToolHandler:
                 result = json.loads(handler({}))
             assert "error" in result
             assert "something went wrong" in result["error"]
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_mcp_application_error_does_not_trip_server_circuit_breaker(self):
+        """A valid tools/call error proves the MCP transport is reachable."""
+        from tools.mcp_tool import (
+            _make_tool_handler,
+            _server_error_counts,
+            _servers,
+        )
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("project is required", is_error=True)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        _server_error_counts["test_srv"] = 2
+
+        try:
+            handler = _make_tool_handler("test_srv", "validate", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert result["error"] == "project is required"
+            assert _server_error_counts.get("test_srv", 0) == 0
+        finally:
+            _servers.pop("test_srv", None)
+            _server_error_counts.pop("test_srv", None)
+
+    def test_sdk_v2_snake_case_call_result(self):
+        """MCP SDK 2.0 exposes is_error/structured_content, not camelCase."""
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result(
+                "ok",
+                sdk_v2=True,
+                structured={"version": 2},
+            )
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "v2_tool", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert result == {
+                "result": "ok",
+                "structuredContent": {"version": 2},
+            }
+        finally:
+            _servers.pop("test_srv", None)
+
+    def test_sdk_v2_snake_case_error_result(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("v2 failure", is_error=True, sdk_v2=True)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+
+        try:
+            handler = _make_tool_handler("test_srv", "v2_fail_tool", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({}))
+            assert result["error"] == "v2 failure"
         finally:
             _servers.pop("test_srv", None)
 

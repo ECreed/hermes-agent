@@ -58,30 +58,13 @@ function formatBytes(size: number | null): string {
   return `${(size / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
-function filenameFromDisposition(value: string | null, fallback: string): string {
-  const match = /filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i.exec(value || "");
-  const raw = match?.[1] || match?.[2] || fallback;
-  try {
-    return decodeURIComponent(raw);
-  } catch {
-    return raw;
-  }
-}
-
-async function downloadResponse(response: Response, fallbackName: string) {
-  if (!response.ok) {
-    const detail = await response.text().catch(() => response.statusText);
-    throw new Error(`${response.status}: ${detail}`);
-  }
-  const blob = await response.blob();
-  const objectUrl = URL.createObjectURL(blob);
+function startBrowserDownload(url: string, filename: string) {
   const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filenameFromDisposition(response.headers.get("content-disposition"), fallbackName || "download");
+  link.href = url;
+  link.download = filename || "download";
   document.body.appendChild(link);
   link.click();
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30_000);
 }
 
 function displayPath(path: string | null | undefined): string {
@@ -255,7 +238,8 @@ export default function FilesPage() {
   const downloadFile = async (entry: ManagedFileEntry) => {
     if (entry.is_directory) return;
     try {
-      await downloadResponse(await api.downloadFile(entry.path), entry.name);
+      const { ticket } = await api.createFileDownloadTicket(entry.path);
+      startBrowserDownload(api.fileDownloadHref(ticket), entry.name);
     } catch (e) {
       showToast(`Download failed: ${e}`, "error");
     }

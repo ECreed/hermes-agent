@@ -104,7 +104,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       const sessionId = explicitSid || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
-      if (event.type === 'gateway.ready') {
+      if (event.type === 'gateway.ready' || event.type === 'device.request') {
+        // HermesGateway handles socket-local device registration/execution so
+        // secondary profile sockets always respond through their own connection.
         return
       } else if (event.type === 'session.info') {
         // Apply session-scoped fields when the event targets the active

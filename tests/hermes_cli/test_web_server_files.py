@@ -41,12 +41,14 @@ def _close_client(client):
 def forced_files_client(monkeypatch, tmp_path):
     root = tmp_path / "data"
     monkeypatch.setenv("HERMES_DASHBOARD_FILES_ROOT", str(root))
+    web_server._reset_managed_download_tickets_for_tests()
 
     client, prev_auth_required, prev_bound_host = _client_with_app_state()
     try:
         yield client, root
     finally:
         _close_client(client)
+        web_server._reset_managed_download_tickets_for_tests()
         _restore_app_state(prev_auth_required, prev_bound_host)
 
 
@@ -276,6 +278,63 @@ def test_download_returns_file_as_attachment(forced_files_client):
     assert "hello.txt" in disposition
 
 
+def test_download_ticket_streams_without_session_header(forced_files_client):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root)
+
+    issued = client.post(
+        "/api/files/download-ticket",
+        json={"path": str(file_path)},
+    )
+    assert issued.status_code == 200
+    assert issued.json()["ttl_seconds"] == 15 * 60
+
+    del client.headers[web_server._SESSION_HEADER_NAME]
+    downloaded = client.get(
+        "/api/files/download-transfer",
+        params={"ticket": issued.json()["ticket"]},
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"hello"
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert "attachment" in downloaded.headers["content-disposition"]
+
+
+def test_download_ticket_is_scoped_and_rejects_unknown_ticket(forced_files_client):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root)
+    other_path = root / "out" / "other.txt"
+    other_path.write_text("other")
+    ticket = client.post(
+        "/api/files/download-ticket",
+        json={"path": str(file_path)},
+    ).json()["ticket"]
+
+    del client.headers[web_server._SESSION_HEADER_NAME]
+    scoped = client.get(
+        "/api/files/download-transfer",
+        params={"ticket": ticket, "path": str(other_path)},
+    )
+    assert scoped.status_code == 200
+    assert scoped.content == b"hello"
+    assert client.get(
+        "/api/files/download-transfer",
+        params={"ticket": "not-a-real-ticket"},
+    ).status_code == 401
+
+
+def test_download_ticket_uses_stream_transfer_limit(forced_files_client, monkeypatch):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root)
+    monkeypatch.setattr(web_server, "_managed_file_transfer_max_bytes", lambda: 4)
+
+    rejected = client.post(
+        "/api/files/download-ticket",
+        json={"path": str(file_path)},
+    )
+    assert rejected.status_code == 413
+
+
 def test_download_rejects_session_token_in_query(forced_files_client):
     client, root = forced_files_client
     file_path = _seed_file(client, root)
@@ -375,7 +434,7 @@ def test_stream_upload_rejects_oversized_without_clobbering(forced_files_client,
     assert file_path.read_bytes() == b"original-contents"
 
     # Shrink the cap so a small payload trips it deterministically.
-    monkeypatch.setattr(web_server, "_MANAGED_FILE_MAX_BYTES", 8)
+    monkeypatch.setattr(web_server, "_managed_file_transfer_max_bytes", lambda: 8)
     rejected = client.post(
         "/api/files/upload-stream",
         data={"path": str(file_path), "overwrite": "true"},
@@ -426,6 +485,8 @@ def test_stream_upload_large_file_under_cap_succeeds(forced_files_client, monkey
     file_path = root / "multi-chunk.bin"
     # 2.5 MiB exercises the chunked read loop across multiple iterations.
     payload = b"x" * (2 * 1024 * 1024 + 512 * 1024)
+    # The in-memory preview/legacy limit does not constrain disk streaming.
+    monkeypatch.setattr(web_server, "_MANAGED_FILE_MAX_BYTES", 1)
 
     created = client.post(
         "/api/files/upload-stream",
@@ -435,6 +496,90 @@ def test_stream_upload_large_file_under_cap_succeeds(forced_files_client, monkey
     assert created.status_code == 200
     assert file_path.stat().st_size == len(payload)
     assert file_path.read_bytes() == payload
+
+
+# ---------------------------------------------------------------------------
+# Desktop session attachment streaming
+# ---------------------------------------------------------------------------
+
+
+def test_session_attachment_stream_writes_raw_body(local_files_client, monkeypatch, tmp_path):
+    client, _home = local_files_client
+    target = tmp_path / "workspace" / ".hermes" / "desktop-attachments" / "large.bin"
+    target.parent.mkdir(parents=True)
+    payload = b"z" * (2 * 1024 * 1024 + 17)
+
+    monkeypatch.setattr(
+        "tui_gateway.server.prepare_session_attachment_upload",
+        lambda session_id, filename, kind: (target, None),
+    )
+
+    created = client.post(
+        "/api/attachments/upload-stream",
+        params={"session_id": "sid", "filename": "large.bin", "kind": "file"},
+        content=payload,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["path"] == str(target)
+    assert created.json()["size"] == len(payload)
+    assert target.read_bytes() == payload
+
+
+def test_session_attachment_stream_cleans_temp_on_limit(local_files_client, monkeypatch, tmp_path):
+    client, _home = local_files_client
+    target = tmp_path / "workspace" / ".hermes" / "desktop-attachments" / "large.bin"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setattr(
+        "tui_gateway.server.prepare_session_attachment_upload",
+        lambda session_id, filename, kind: (target, None),
+    )
+    monkeypatch.setattr(web_server, "_managed_file_transfer_max_bytes", lambda: 8)
+
+    rejected = client.post(
+        "/api/attachments/upload-stream",
+        params={"session_id": "sid", "filename": "large.bin", "kind": "file"},
+        content=b"too many bytes",
+        # Keep the declared size under the cap so the streaming loop, not the
+        # early Content-Length guard, detects the overflow and runs cleanup.
+        headers={"Content-Length": "4", "Content-Type": "application/octet-stream"},
+    )
+
+    assert rejected.status_code == 413
+    assert not target.exists()
+    assert list(target.parent.glob("*.upload")) == []
+
+
+def test_fs_download_streams_beyond_data_url_preview_cap(local_files_client, monkeypatch, tmp_path):
+    client, _home = local_files_client
+    target = tmp_path / "artifact.bin"
+    payload = b"artifact-bytes"
+    target.write_bytes(payload)
+    monkeypatch.setattr(web_server, "_FS_DATA_URL_MAX_BYTES", 4)
+
+    preview = client.get("/api/fs/read-data-url", params={"path": str(target)})
+    downloaded = client.get("/api/fs/download", params={"path": str(target)})
+
+    assert preview.status_code == 413
+    assert downloaded.status_code == 200
+    assert downloaded.content == payload
+
+
+def test_stream_transfer_limit_comes_from_dashboard_config(monkeypatch):
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {"dashboard": {"max_file_transfer_gb": 3}},
+    )
+    assert web_server._managed_file_transfer_max_bytes() == 3 * 1024**3
+
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {"dashboard": {"max_file_transfer_gb": 999}},
+    )
+    assert web_server._managed_file_transfer_max_bytes() == 64 * 1024**3
 
 
 def test_stream_upload_cleans_temp_on_cancellation(forced_files_client):

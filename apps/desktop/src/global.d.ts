@@ -63,6 +63,22 @@ declare global {
         set: (name: string | null) => Promise<DesktopActiveProfile>
       }
       api: <T>(request: HermesApiRequest) => Promise<T>
+      device?: {
+        getIdentity: () => Promise<{ endpointId: string; proof: string; alias: string; platform: string }>
+        executeComputerUse: (args: Record<string, unknown>) => Promise<unknown>
+      }
+      uploadAttachment?: (payload: {
+        filePath: string
+        kind: 'file' | 'image'
+        name?: string
+        profile?: string
+        sessionId: string
+      }) => Promise<{ kind: 'file' | 'image'; name: string; path: string; size: number }>
+      downloadGatewayFile?: (payload: {
+        name?: string
+        path: string
+        profile?: string
+      }) => Promise<{ canceled: boolean; path: string | null }>
       notify: (payload: HermesNotification) => Promise<boolean>
       requestMicrophoneAccess: () => Promise<boolean>
       readFileDataUrl: (filePath: string) => Promise<string>

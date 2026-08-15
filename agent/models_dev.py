@@ -453,6 +453,8 @@ def infer_model_reasoning_efforts(
         or "openai" in slug
         or "subapi" in slug
     ):
+        if "subapi" in slug:
+            return ("minimal", "low", "medium", "high", "xhigh", "max")
         return _DEFAULT_REASONING_EFFORTS
 
     if name.startswith("claude-") or "anthropic" in slug:

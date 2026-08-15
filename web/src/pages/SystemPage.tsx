@@ -421,17 +421,13 @@ export default function SystemPage() {
     if (!archive) return;
     setDownloadingBackup(true);
     try {
-      const res = await api.downloadBackup(archive);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
+      const { ticket } = await api.createFileDownloadTicket(archive);
       const link = document.createElement("a");
-      link.href = url;
+      link.href = api.fileDownloadHref(ticket);
       link.download = backupFileName(archive);
       document.body.appendChild(link);
       link.click();
       link.remove();
-      URL.revokeObjectURL(url);
     } catch (e) {
       showToast(`Download failed: ${e}`, "error");
     } finally {

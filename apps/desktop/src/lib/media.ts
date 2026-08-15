@@ -118,6 +118,20 @@ export async function gatewayMediaDataUrl(path: string): Promise<string> {
 // The file lives on the gateway, so fetch it over the authenticated fs bridge
 // and hand the bytes to the local browser shell as a download.
 export async function downloadGatewayMediaFile(path: string): Promise<void> {
+  const nativeDownload = window.hermesDesktop?.downloadGatewayFile
+
+  if (nativeDownload) {
+    await nativeDownload({
+      name: mediaName(path),
+      path: filePathFromMediaPath(path),
+      profile: $connection.get()?.profile
+    })
+
+    return
+  }
+
+  // Compatibility path for older desktop shells. New builds keep the payload
+  // out of renderer memory and stream it directly to disk in the main process.
   const dataUrl = await readDesktopFileDataUrl(filePathFromMediaPath(path))
 
   if (!dataUrl) {

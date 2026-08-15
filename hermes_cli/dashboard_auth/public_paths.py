@@ -52,4 +52,9 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # the NAS relay's bearer-only callback reaches the verifier instead of a
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
+    # Browser-native file transfer endpoint. The opaque, short-lived ticket is
+    # its own capability credential, minted by an authenticated API call and
+    # scoped to one resolved file. This bypass is required because a browser
+    # navigation cannot attach the loopback dashboard's custom auth header.
+    "/api/files/download-transfer",
 })

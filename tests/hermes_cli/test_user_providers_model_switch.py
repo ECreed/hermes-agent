@@ -357,6 +357,43 @@ def test_resolve_provider_full_user_config_openai_beats_alias():
     assert "openrouter" not in pdef.base_url
 
 
+def test_resolve_provider_full_uses_model_provider_plugin_alias(monkeypatch):
+    """Plugin-declared aliases should reach the canonical user provider.
+
+    Model-provider profiles and hermes_cli.providers historically maintained
+    separate alias registries. That made an alias valid for auth but unknown
+    to the /model switch path.
+    """
+    from providers.base import ProviderProfile
+    from hermes_cli.providers import resolve_provider_full
+
+    profile = ProviderProfile(
+        name="canonical-proxy",
+        aliases=("legacy-proxy",),
+    )
+    monkeypatch.setattr(
+        "providers.get_provider_profile",
+        lambda name: profile if name in {profile.name, *profile.aliases} else None,
+    )
+
+    pdef = resolve_provider_full(
+        "legacy-proxy",
+        {
+            "canonical-proxy": {
+                "name": "Canonical Proxy",
+                "base_url": "http://127.0.0.1:18080/v1",
+                "key_env": "PROXY_API_KEY",
+            }
+        },
+        [],
+    )
+
+    assert pdef is not None
+    assert pdef.id == "canonical-proxy"
+    assert pdef.source == "user-config"
+    assert pdef.base_url == "http://127.0.0.1:18080/v1"
+
+
 def test_switch_model_user_config_openai_does_not_hop_to_openrouter(monkeypatch):
     """End-to-end: selecting a providers.openai config row in the picker must
     resolve to api.openai.com, never silently switch to OpenRouter."""

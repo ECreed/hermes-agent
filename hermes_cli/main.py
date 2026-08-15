@@ -13287,6 +13287,10 @@ def main():
         "status",
         help="Print whether cua-driver is installed and on PATH",
     )
+    computer_use_sub.add_parser(
+        "device-worker",
+        help=argparse.SUPPRESS,
+    )
     computer_use_doctor = computer_use_sub.add_parser(
         "doctor",
         help="Run cua-driver `health_report` and surface the check matrix",
@@ -13353,6 +13357,10 @@ def main():
 
     def cmd_computer_use(args):
         action = getattr(args, "computer_use_action", None)
+        if action == "device-worker":
+            from tools.computer_use.device_worker import main as run_device_worker
+
+            sys.exit(run_device_worker())
         if action == "install":
             from hermes_cli.tools_config import install_cua_driver
             install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))

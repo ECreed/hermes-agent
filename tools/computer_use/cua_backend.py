@@ -1042,8 +1042,14 @@ def _extract_tool_result(mcp_result: Any) -> Dict[str, Any]:
     data: Any = None
     images: List[str] = []
     image_mime_types: List[str] = []
-    is_error = bool(getattr(mcp_result, "isError", False))
-    structured: Optional[Dict] = getattr(mcp_result, "structuredContent", None) or None
+    raw_is_error = getattr(mcp_result, "is_error", None)
+    if raw_is_error is None:
+        raw_is_error = getattr(mcp_result, "isError", False)
+    is_error = bool(raw_is_error)
+    structured: Optional[Dict] = getattr(mcp_result, "structured_content", None)
+    if structured is None:
+        structured = getattr(mcp_result, "structuredContent", None)
+    structured = structured or None
     text_chunks: List[str] = []
     for part in getattr(mcp_result, "content", []) or []:
         ptype = getattr(part, "type", None)

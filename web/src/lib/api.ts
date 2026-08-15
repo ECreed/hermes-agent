@@ -272,6 +272,12 @@ export function buildArtifactDownloadHref(id: string): string {
   return `${BASE}/api/artifacts/download?${qs.toString()}`;
 }
 
+export function buildManagedFileDownloadHref(ticket: string): string {
+  const qs = new URLSearchParams();
+  qs.set("ticket", ticket);
+  return `${BASE}/api/files/download-transfer?${qs.toString()}`;
+}
+
 /**
  * Build an absolute ``ws(s)://`` URL for a dashboard WebSocket endpoint,
  * with the correct auth query param appended for the active mode (fresh
@@ -442,6 +448,13 @@ export const api = {
       body: form,
     });
   },
+  createFileDownloadTicket: (path: string) =>
+    fetchJSON<ManagedFileDownloadTicketResponse>("/api/files/download-ticket", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+  fileDownloadHref: (ticket: string) => buildManagedFileDownloadHref(ticket),
   createDirectory: (path: string) =>
     fetchJSON<ManagedFileWriteResponse>("/api/files/mkdir", {
       method: "POST",
@@ -1976,6 +1989,11 @@ export interface ManagedFileWriteResponse {
   root: string | null;
   locked_root: string | null;
   can_change_path: boolean;
+}
+
+export interface ManagedFileDownloadTicketResponse {
+  ticket: string;
+  ttl_seconds: number;
 }
 
 export interface ArtifactRecord {

@@ -7,6 +7,7 @@ import http from 'node:http'
 import https from 'node:https'
 import os from 'node:os'
 import path from 'node:path'
+import { pipeline } from 'node:stream/promises'
 import { pathToFileURL } from 'node:url'
 
 import {
@@ -369,6 +370,7 @@ const BOOTSTRAP_COMPLETE_MARKER = path.join(ACTIVE_HERMES_ROOT, '.hermes-bootstr
 const BOOTSTRAP_MARKER_SCHEMA_VERSION = 1
 
 const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'connection.json')
+const DESKTOP_DEVICE_CONFIG_PATH = path.join(app.getPath('userData'), 'device.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
 const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-state.json')
 // active-profile.json records which Hermes profile the desktop launches its
@@ -3751,6 +3753,369 @@ function fetchJson(url, token, options: any = {}) {
     }
     req.end()
   })
+}
+
+function readDesktopDeviceIdentity() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(DESKTOP_DEVICE_CONFIG_PATH, 'utf8'))
+    const endpointId = String(parsed?.endpointId || '').trim()
+    const proof = String(parsed?.proof || '').trim()
+
+    if (endpointId && proof) {
+      return {
+        endpointId,
+        proof,
+        alias: String(parsed?.alias || os.hostname()).trim() || os.hostname(),
+        platform: process.platform
+      }
+    }
+  } catch {
+    // First launch or a corrupt identity file: replace it below.
+  }
+
+  const identity = {
+    endpointId: crypto.randomUUID(),
+    proof: crypto.randomBytes(32).toString('base64url'),
+    alias: os.hostname(),
+    platform: process.platform
+  }
+  fs.mkdirSync(path.dirname(DESKTOP_DEVICE_CONFIG_PATH), { recursive: true })
+  fs.writeFileSync(DESKTOP_DEVICE_CONFIG_PATH, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 })
+  return identity
+}
+
+let computerUseWorker = null
+let computerUseWorkerStartPromise = null
+let computerUseWorkerSequence = 0
+const computerUseWorkerPending = new Map()
+
+function failComputerUseWorkerPending(error) {
+  for (const pending of computerUseWorkerPending.values()) {
+    pending.reject(error)
+  }
+  computerUseWorkerPending.clear()
+}
+
+async function ensureComputerUseWorker() {
+  if (computerUseWorker && computerUseWorker.exitCode === null && !computerUseWorker.killed) {
+    return computerUseWorker
+  }
+  if (computerUseWorkerStartPromise) {
+    return computerUseWorkerStartPromise
+  }
+
+  computerUseWorkerStartPromise = (async () => {
+    const backend = await ensureRuntime(resolveHermesBackend(['computer-use', 'device-worker']))
+    const child = spawn(
+      backend.command,
+      backend.args,
+      hiddenWindowsChildOptions({
+        cwd: resolveHermesCwd(),
+        env: { ...process.env, HERMES_HOME, ...backend.env },
+        shell: backend.shell,
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+    )
+    computerUseWorker = child
+    let workerBuffer = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      workerBuffer += chunk
+      while (true) {
+        const newline = workerBuffer.indexOf('\n')
+        if (newline < 0) break
+        const line = workerBuffer.slice(0, newline).trim()
+        workerBuffer = workerBuffer.slice(newline + 1)
+        if (!line) continue
+        try {
+          const response = JSON.parse(line)
+          const pending = computerUseWorkerPending.get(String(response.id))
+          if (!pending || pending.worker !== child) continue
+          computerUseWorkerPending.delete(String(response.id))
+          response.ok
+            ? pending.resolve(response.result)
+            : pending.reject(new Error(response.error || 'Computer Use failed'))
+        } catch (error) {
+          rememberLog(`Computer Use worker returned invalid JSON: ${error}`)
+        }
+      }
+    })
+    child.stderr.on('data', rememberLog)
+    const failOwned = error => {
+      if (computerUseWorker === child) computerUseWorker = null
+      for (const [id, pending] of computerUseWorkerPending) {
+        if (pending.worker !== child) continue
+        computerUseWorkerPending.delete(id)
+        pending.reject(error)
+      }
+    }
+    child.once('exit', (code, signal) => failOwned(new Error(`Computer Use worker exited (${signal || code})`)))
+    child.once('error', failOwned)
+    return child
+  })()
+
+  try {
+    return await computerUseWorkerStartPromise
+  } finally {
+    computerUseWorkerStartPromise = null
+  }
+}
+
+async function executeLocalComputerUse(args) {
+  const child = await ensureComputerUseWorker()
+  const id = String(++computerUseWorkerSequence)
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      computerUseWorkerPending.delete(id)
+      reject(new Error('Computer Use worker timed out'))
+    }, 90_000)
+    computerUseWorkerPending.set(id, {
+      resolve: value => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      reject: error => {
+        clearTimeout(timer)
+        reject(error)
+      },
+      worker: child
+    })
+    child.stdin.write(`${JSON.stringify({ id, args: args || {} })}\n`, error => {
+      if (!error) return
+      clearTimeout(timer)
+      computerUseWorkerPending.delete(id)
+      reject(error)
+    })
+  })
+}
+
+function authenticatedStreamRequest(connection, url, options: any = {}) {
+  const headers = { ...(options.headers || {}) }
+
+  if (connection.authMode === 'oauth') {
+    const sess = getOauthSession()
+
+    if (!sess) {
+      throw new Error('OAuth session partition is unavailable.')
+    }
+
+    const request = electronNet.request({
+      method: options.method || 'GET',
+      url,
+      session: sess,
+      useSessionCookies: true,
+      redirect: 'follow'
+    } as any)
+
+    for (const [name, value] of Object.entries(headers)) {
+      request.setHeader(name, String(value))
+    }
+
+    return request
+  }
+
+  const parsed = new URL(url)
+  const client = parsed.protocol === 'https:' ? https : parsed.protocol === 'http:' ? http : null
+
+  if (!client) {
+    throw new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`)
+  }
+
+  return client.request(parsed, {
+    method: options.method || 'GET',
+    headers: {
+      ...headers,
+      'X-Hermes-Session-Token': connection.token
+    }
+  })
+}
+
+function abortStreamRequest(request, error?: Error) {
+  if (typeof request.destroy === 'function') {
+    request.destroy(error)
+  } else {
+    request.abort()
+  }
+}
+
+function collectSmallResponse(response, maxBytes = 1024 * 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let total = 0
+
+    response.on('error', reject)
+    response.on('data', chunk => {
+      const data = Buffer.from(chunk)
+      total += data.length
+      if (total <= maxBytes) {
+        chunks.push(data)
+      }
+    })
+    response.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+  })
+}
+
+async function uploadAttachmentFile(payload) {
+  const profile = payload?.profile
+  const kind = payload?.kind === 'image' ? 'image' : 'file'
+  const sessionId = String(payload?.sessionId || '').trim()
+  const filePath = String(payload?.filePath || '').trim()
+  const requestedName = String(payload?.name || '').trim()
+
+  if (!sessionId || !filePath) {
+    throw new Error('Attachment session and file path are required.')
+  }
+
+  const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
+    purpose: 'Attachment upload'
+  })
+  const filename = requestedName || path.basename(resolvedPath)
+  const connection = await ensureBackend(profile)
+  const query = new URLSearchParams({ filename, kind, session_id: sessionId })
+  const requestPath = pathWithGlobalRemoteProfile(`/api/attachments/upload-stream?${query}`, profile, {
+    globalRemote: globalRemoteActive(),
+    profileRemoteOverride: profileHasRemoteOverride(profile)
+  })
+  const url = `${connection.baseUrl}${requestPath}`
+
+  return new Promise((resolve, reject) => {
+    let request
+
+    try {
+      request = authenticatedStreamRequest(connection, url, {
+        method: 'POST',
+        headers: {
+          'Content-Length': String(stat.size),
+          'Content-Type': 'application/octet-stream'
+        }
+      })
+    } catch (error) {
+      reject(error)
+
+      return
+    }
+
+    let settled = false
+    const finish = (error, value?) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      error ? reject(error) : resolve(value)
+    }
+
+    request.once('error', error => finish(error))
+    request.once('response', async response => {
+      try {
+        const text = await collectSmallResponse(response)
+        const statusCode = response.statusCode || 500
+
+        if (statusCode >= 400) {
+          finish(new Error(`${statusCode}: ${text || response.statusMessage || 'Upload failed'}`))
+
+          return
+        }
+
+        finish(null, text ? JSON.parse(text) : null)
+      } catch (error) {
+        finish(error)
+      }
+    })
+
+    const source = fs.createReadStream(resolvedPath)
+    source.once('error', error => {
+      abortStreamRequest(request, error)
+      finish(error)
+    })
+    source.pipe(request)
+  })
+}
+
+function remoteFileName(filePath: string): string {
+  try {
+    if (/^file:/i.test(filePath)) {
+      return decodeURIComponent(new URL(filePath).pathname).split('/').filter(Boolean).pop() || 'download'
+    }
+  } catch {
+    // Fall through to plain path parsing.
+  }
+
+  return filePath.split(/[\\/]/).filter(Boolean).pop() || 'download'
+}
+
+async function downloadGatewayFile(payload) {
+  const profile = payload?.profile
+  const filePath = String(payload?.path || '').trim()
+
+  if (!filePath) {
+    throw new Error('Gateway file path is required.')
+  }
+
+  const suggestedName = String(payload?.name || '').trim() || remoteFileName(filePath)
+  const saveOptions = { defaultPath: suggestedName }
+  const choice =
+    mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showSaveDialog(mainWindow, saveOptions)
+      : await dialog.showSaveDialog(saveOptions)
+
+  if (choice.canceled || !choice.filePath) {
+    return { canceled: true, path: null }
+  }
+
+  const connection = await ensureBackend(profile)
+  const requestPath = pathWithGlobalRemoteProfile(
+    `/api/fs/download?path=${encodeURIComponent(filePath)}`,
+    profile,
+    {
+      globalRemote: globalRemoteActive(),
+      profileRemoteOverride: profileHasRemoteOverride(profile)
+    }
+  )
+  const url = `${connection.baseUrl}${requestPath}`
+  const targetPath = choice.filePath
+  const tempPath = path.join(
+    path.dirname(targetPath),
+    `.${path.basename(targetPath)}.hermes-${crypto.randomUUID()}.part`
+  )
+
+  try {
+    await new Promise((resolve, reject) => {
+      let request
+
+      try {
+        request = authenticatedStreamRequest(connection, url)
+      } catch (error) {
+        reject(error)
+
+        return
+      }
+
+      request.once('error', reject)
+      request.once('response', async response => {
+        try {
+          const statusCode = response.statusCode || 500
+          if (statusCode >= 400) {
+            const text = await collectSmallResponse(response)
+            reject(new Error(`${statusCode}: ${text || response.statusMessage || 'Download failed'}`))
+
+            return
+          }
+
+          await pipeline(response, fs.createWriteStream(tempPath, { flags: 'wx' }))
+          resolve(undefined)
+        } catch (error) {
+          reject(error)
+        }
+      })
+      request.end()
+    })
+    await fs.promises.rename(tempPath, targetPath)
+  } catch (error) {
+    await fs.promises.rm(tempPath, { force: true }).catch(() => undefined)
+    throw error
+  }
+
+  return { canceled: false, path: targetPath }
 }
 
 function fetchPublicJson(url, options: any = {}) {
@@ -7447,6 +7812,14 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   })
 })
 
+ipcMain.handle('hermes:device:identity', () => readDesktopDeviceIdentity())
+
+ipcMain.handle('hermes:device:computer-use', (_event, payload) => executeLocalComputerUse(payload?.args || {}))
+
+ipcMain.handle('hermes:attachment:upload', (_event, payload) => uploadAttachmentFile(payload))
+
+ipcMain.handle('hermes:gateway-file:download', (_event, payload) => downloadGatewayFile(payload))
+
 ipcMain.handle('hermes:notify', (_event, payload) => {
   if (!Notification.isSupported()) {
     return false
@@ -8592,6 +8965,10 @@ app.on('before-quit', () => {
     disposeTerminalSession(id)
   }
 
+  failComputerUseWorkerPending(new Error('Hermes Desktop is quitting'))
+  computerUseWorkerStartPromise = null
+  stopBackendChild(computerUseWorker)
+  computerUseWorker = null
   stopBackendChild(hermesProcess)
   stopAllPoolBackends()
 })

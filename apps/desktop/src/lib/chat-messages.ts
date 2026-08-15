@@ -77,6 +77,8 @@ export type GatewayEventPayload = {
   // session.title (live auto-title push) — stored session id + generated title
   session_id?: string
   title?: string
+  endpoint_id?: string
+  method?: string
   // moa.reference / moa.aggregating (Mixture of Agents per-model relay)
   label?: string
   index?: number

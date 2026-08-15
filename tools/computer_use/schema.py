@@ -81,6 +81,15 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "one window or display at a time."
                 ),
             },
+            "target": {
+                "type": "string",
+                "description": (
+                    "Optional Desktop endpoint id or unique device alias. "
+                    "Omit it to control the Desktop that submitted the current "
+                    "turn. Set it only when the user explicitly names another "
+                    "registered computer."
+                ),
+            },
             "max_elements": {
                 "type": "integer",
                 "description": (

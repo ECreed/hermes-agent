@@ -932,6 +932,10 @@ class ManagedFileUpload(BaseModel):
     overwrite: bool = True
 
 
+class ManagedFileDownloadTicketRequest(BaseModel):
+    path: str
+
+
 class ManagedDirectoryCreate(BaseModel):
     path: str
 
@@ -1280,8 +1284,76 @@ _MEDIA_CONTENT_TYPES = {
 }
 _MEDIA_MAX_BYTES = 25 * 1024 * 1024
 _MANAGED_FILES_ROOT_ENV = "HERMES_DASHBOARD_FILES_ROOT"
+# JSON previews and the legacy base64 upload endpoint are intentionally kept
+# small because they materialize the complete file in memory.
 _MANAGED_FILE_MAX_BYTES = 100 * 1024 * 1024
+_MANAGED_FILE_TRANSFER_DEFAULT_GB = 8
+_MANAGED_FILE_TRANSFER_MAX_GB = 64
+_MANAGED_DOWNLOAD_TICKET_TTL_SECONDS = 15 * 60
+_MANAGED_DOWNLOAD_TICKET_MAX_ACTIVE = 512
+_managed_download_tickets: Dict[str, Tuple[float, str]] = {}
+_managed_download_ticket_lock = threading.Lock()
 _HOSTED_MANAGED_FILES_ROOT = Path("/opt/data")
+
+
+def _managed_file_transfer_max_bytes() -> int:
+    """Return the configured disk-streaming limit, clamped to 1-64 GiB."""
+    try:
+        configured = cfg_get(
+            load_config(),
+            "dashboard",
+            "max_file_transfer_gb",
+            default=_MANAGED_FILE_TRANSFER_DEFAULT_GB,
+        )
+        if isinstance(configured, bool):
+            raise ValueError
+        limit_gb = int(configured)
+    except (TypeError, ValueError, OSError):
+        limit_gb = _MANAGED_FILE_TRANSFER_DEFAULT_GB
+    limit_gb = max(1, min(_MANAGED_FILE_TRANSFER_MAX_GB, limit_gb))
+    return limit_gb * 1024 * 1024 * 1024
+
+
+def _mint_managed_download_ticket(path: Path) -> str:
+    now = time.time()
+    ticket = secrets.token_urlsafe(32)
+    with _managed_download_ticket_lock:
+        expired = [
+            value
+            for value, (expires_at, _path) in _managed_download_tickets.items()
+            if expires_at < now
+        ]
+        for value in expired:
+            _managed_download_tickets.pop(value, None)
+        if len(_managed_download_tickets) >= _MANAGED_DOWNLOAD_TICKET_MAX_ACTIVE:
+            oldest = min(
+                _managed_download_tickets,
+                key=lambda value: _managed_download_tickets[value][0],
+            )
+            _managed_download_tickets.pop(oldest, None)
+        _managed_download_tickets[ticket] = (
+            now + _MANAGED_DOWNLOAD_TICKET_TTL_SECONDS,
+            str(path),
+        )
+    return ticket
+
+
+def _resolve_managed_download_ticket(ticket: str) -> str:
+    now = time.time()
+    with _managed_download_ticket_lock:
+        entry = _managed_download_tickets.get(ticket)
+        if entry is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired download ticket")
+        expires_at, path = entry
+        if expires_at < now:
+            _managed_download_tickets.pop(ticket, None)
+            raise HTTPException(status_code=401, detail="Invalid or expired download ticket")
+    return path
+
+
+def _reset_managed_download_tickets_for_tests() -> None:
+    with _managed_download_ticket_lock:
+        _managed_download_tickets.clear()
 
 
 @dataclass(frozen=True)
@@ -2503,15 +2575,7 @@ async def read_managed_file(request: Request, path: str):
     }
 
 
-@app.get("/api/files/download")
-async def download_managed_file(request: Request, path: str):
-    """Stream a managed file as an attachment download.
-
-    Dashboard callers use ``authedFetch`` and the desktop uses its authenticated
-    filesystem bridge. Session credentials are deliberately rejected in query
-    strings so they cannot leak through URL logging or browser history.
-    """
-    _require_token(request)
+def _managed_download_target(request: Request, path: str) -> Path:
     policy, target, _display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -2524,17 +2588,49 @@ async def download_managed_file(request: Request, path: str):
         size = target.stat().st_size
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not stat file: {exc}")
-    if size > _MANAGED_FILE_MAX_BYTES:
+    if size > _managed_file_transfer_max_bytes():
         raise HTTPException(status_code=413, detail="File is too large")
+    return target
 
+
+def _managed_download_response(target: Path) -> FileResponse:
     mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-
     return FileResponse(
         path=str(target),
         media_type=mime_type,
         filename=target.name,
         content_disposition_type="attachment",
+        headers={"Cache-Control": "private, no-store"},
     )
+
+
+@app.get("/api/files/download")
+async def download_managed_file(request: Request, path: str):
+    """Stream a managed file for authenticated API/desktop callers."""
+    _require_token(request)
+    return _managed_download_response(_managed_download_target(request, path))
+
+
+@app.post("/api/files/download-ticket")
+async def create_managed_file_download_ticket(
+    payload: ManagedFileDownloadTicketRequest,
+    request: Request,
+):
+    """Mint a short-lived capability URL for a browser-native download."""
+    _require_token(request)
+    target = _managed_download_target(request, payload.path)
+    ticket = _mint_managed_download_ticket(target)
+    return {
+        "ticket": ticket,
+        "ttl_seconds": _MANAGED_DOWNLOAD_TICKET_TTL_SECONDS,
+    }
+
+
+@app.get("/api/files/download-transfer")
+async def download_managed_file_transfer(request: Request, ticket: str):
+    """Stream a ticket-scoped file without buffering it in browser memory."""
+    path = _resolve_managed_download_ticket(ticket)
+    return _managed_download_response(_managed_download_target(request, path))
 
 
 @app.get("/api/artifacts")
@@ -2657,6 +2753,7 @@ async def upload_managed_file_stream(
     tmp_path = Path(tmp_name)
     total = 0
     renamed = False
+    max_bytes = _managed_file_transfer_max_bytes()
     try:
         with os.fdopen(tmp_fd, "wb") as out:
             while True:
@@ -2664,7 +2761,7 @@ async def upload_managed_file_stream(
                 if not chunk:
                     break
                 total += len(chunk)
-                if total > _MANAGED_FILE_MAX_BYTES:
+                if total > max_bytes:
                     raise HTTPException(status_code=413, detail="File is too large")
                 out.write(chunk)
         os.replace(tmp_path, target)
@@ -2690,6 +2787,82 @@ async def upload_managed_file_stream(
         "entry": _managed_file_entry(policy, target),
         "path": display_path,
         **_managed_response_meta(policy),
+    }
+
+
+@app.post("/api/attachments/upload-stream")
+async def upload_session_attachment_stream(
+    request: Request,
+    session_id: str,
+    filename: str,
+    kind: str = "file",
+):
+    """Stream a desktop attachment directly into a live session workspace.
+
+    Remote desktop clients previously base64-encoded the complete file and put
+    it in one JSON-RPC WebSocket frame. This raw-body endpoint keeps memory
+    bounded, avoids base64 inflation, and leaves the RPC channel carrying only
+    the small gateway-local path returned below.
+    """
+    _require_token(request)
+    try:
+        from tui_gateway.server import prepare_session_attachment_upload
+
+        target, attachment_limit = prepare_session_attachment_upload(
+            session_id,
+            filename,
+            kind,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    max_bytes = _managed_file_transfer_max_bytes()
+    if attachment_limit is not None:
+        max_bytes = min(max_bytes, attachment_limit)
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise HTTPException(status_code=413, detail="File is too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length")
+
+    tmp_fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".upload", dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
+    total = 0
+    renamed = False
+    try:
+        with os.fdopen(tmp_fd, "wb") as out:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(status_code=413, detail="File is too large")
+                out.write(chunk)
+        os.replace(tmp_path, target)
+        renamed = True
+    except HTTPException:
+        raise
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Attachment is not writable")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write attachment: {exc}")
+    finally:
+        if not renamed:
+            tmp_path.unlink(missing_ok=True)
+
+    return {
+        "ok": True,
+        "kind": kind,
+        "name": target.name,
+        "path": str(target),
+        "size": total,
     }
 
 
@@ -2853,6 +3026,22 @@ async def fs_read_data_url(path: str):
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc) or "File read failed")
     return {"dataUrl": f"data:{_fs_mime_type(target)};base64,{encoded}"}
+
+
+@app.get("/api/fs/download")
+async def fs_download(path: str, request: Request):
+    """Stream a gateway-local file to an authenticated desktop client."""
+    _require_token(request)
+    target, st = _fs_regular_file(_fs_path(path))
+    if st.st_size > _managed_file_transfer_max_bytes():
+        raise HTTPException(status_code=413, detail="File is too large")
+    return FileResponse(
+        path=str(target),
+        media_type=_fs_mime_type(target),
+        filename=target.name,
+        content_disposition_type="attachment",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @app.get("/api/fs/git-root")
@@ -12445,6 +12634,7 @@ async def run_import_upload(
     tmp_path = Path(tmp_name)
     total = 0
     renamed = False
+    max_bytes = _managed_file_transfer_max_bytes()
     try:
         with os.fdopen(tmp_fd, "wb") as out:
             while True:
@@ -12452,7 +12642,7 @@ async def run_import_upload(
                 if not chunk:
                     break
                 total += len(chunk)
-                if total > _MANAGED_FILE_MAX_BYTES:
+                if total > max_bytes:
                     raise HTTPException(status_code=413, detail="Archive is too large")
                 out.write(chunk)
         os.replace(tmp_path, target)

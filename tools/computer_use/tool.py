@@ -144,8 +144,26 @@ _session_auto_approve = False
 _always_allow: set = set()  # action names the user unlocked for the session
 
 
-def _get_backend() -> ComputerUseBackend:
+def _get_backend(explicit_target: Optional[str] = None) -> ComputerUseBackend:
     global _backend
+    # A remote endpoint is turn-scoped. Never cache it process-wide: concurrent
+    # desktop sessions may originate on different PCs, and the same session may
+    # move between devices on later turns.
+    try:
+        from tools.computer_use.remote import (
+            RemoteComputerUseBackend,
+            current_target_endpoint,
+            current_turn_yolo,
+        )
+
+        endpoint = current_target_endpoint(explicit_target)
+        if endpoint:
+            backend = RemoteComputerUseBackend(endpoint, yolo=current_turn_yolo())
+            backend.start()
+            return backend
+    except ImportError:
+        pass
+
     with _backend_lock:
         if _backend is None:
             backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
@@ -273,7 +291,7 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 
     # Dispatch to backend.
     try:
-        backend = _get_backend()
+        backend = _get_backend(args.get("target"))
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
@@ -908,6 +926,13 @@ def check_computer_use_requirements() -> bool:
     """
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
+    try:
+        from tools.computer_use.remote import list_devices
+
+        if list_devices():
+            return True
+    except ImportError:
+        pass
     from tools.computer_use.cua_backend import cua_driver_binary_available
     return cua_driver_binary_available()
 

@@ -130,6 +130,14 @@ export function exitProjectScope(): void {
   $projectScope.set(ALL_PROJECTS)
 }
 
+// Leave the project drill-in and return to the flat, all-session view in one
+// action. The old two-step flow (project -> project overview -> sessions) made a
+// single-project sidebar look as if all historical sessions had disappeared.
+export function exitProjectToSessions(): void {
+  $projectScope.set(ALL_PROJECTS)
+  setSidebarAgentsGrouped(false)
+}
+
 // The cwd a NEW chat should start in. The "active project" is just an atom
 // ($projectScope) — so when you're inside a project, a new session (cmd-n, the
 // trunk "+") starts at that project's root (its primary repo = the default-branch

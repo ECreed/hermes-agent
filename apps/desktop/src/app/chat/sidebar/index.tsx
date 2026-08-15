@@ -71,6 +71,7 @@ import {
   ALL_PROJECTS,
   enterProject,
   exitProjectScope,
+  exitProjectToSessions,
   fetchProjectSessions,
   openProjectCreate,
   refreshProjects,
@@ -1226,7 +1227,7 @@ export function ChatSidebar({
                       )}
                       <ProjectMenu
                         isActive={enteredProject.id === activeProjectId}
-                        onExitScope={exitProjectScope}
+                        onExitScope={exitProjectToSessions}
                         project={enteredProject}
                         scoped
                       />
@@ -1236,7 +1237,7 @@ export function ChatSidebar({
                           className={HEADER_NAV_BTN}
                           onClick={event => {
                             event.stopPropagation()
-                            exitProjectScope()
+                            exitProjectToSessions()
                           }}
                           size="icon-xs"
                           variant="ghost"
@@ -1313,7 +1314,7 @@ export function ChatSidebar({
                 open={agentsOpen}
                 pinned={false}
                 projectBackRow={
-                  inProject ? <ProjectBackRow label={s.projects.back} onClick={exitProjectScope} /> : undefined
+                  inProject ? <ProjectBackRow label={s.projects.back} onClick={exitProjectToSessions} /> : undefined
                 }
                 projectContent={inProject ? enteredProjectContent : undefined}
                 projectOverview={projectOverview}

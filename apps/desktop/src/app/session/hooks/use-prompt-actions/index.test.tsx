@@ -846,6 +846,84 @@ describe('usePromptActions file attachment sync', () => {
     }
   }
 
+  it('streams a remote file through the native bridge before registering its gateway path', async () => {
+    $connection.set({ mode: 'remote', profile: 'subapi' } as never)
+    const uploadAttachment = vi.fn(async () => ({
+      kind: 'file' as const,
+      name: 'report.txt',
+      path: '/remote/work/.hermes/desktop-attachments/report.txt',
+      size: 512 * 1024 * 1024
+    }))
+    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,unused')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl, uploadAttachment }
+    })
+    const requestGateway = vi.fn(async () => ({
+      attached: true,
+      ref_text: '@file:.hermes/desktop-attachments/report.txt',
+      uploaded: false
+    }) as never)
+
+    const result = await uploadComposerAttachment(fileAttachment(), {
+      remote: true,
+      requestGateway,
+      sessionId: RUNTIME_SESSION_ID
+    })
+
+    expect(uploadAttachment).toHaveBeenCalledWith({
+      filePath: '/Users/alice/Downloads/report.txt',
+      kind: 'file',
+      name: 'report.txt',
+      profile: 'subapi',
+      sessionId: RUNTIME_SESSION_ID
+    })
+    expect(readFileDataUrl).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('file.attach', {
+      name: 'report.txt',
+      path: '/remote/work/.hermes/desktop-attachments/report.txt',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(result.refText).toBe('@file:.hermes/desktop-attachments/report.txt')
+  })
+
+  it('streams a remote image before registering it with image.attach', async () => {
+    $connection.set({ mode: 'remote', profile: 'subapi' } as never)
+    const uploadAttachment = vi.fn(async () => ({
+      kind: 'image' as const,
+      name: 'diagram.png',
+      path: '/home/ai/.hermes/images/diagram.png',
+      size: 8 * 1024 * 1024
+    }))
+    const readFileDataUrl = vi.fn(async () => 'data:image/png;base64,unused')
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { readFileDataUrl, uploadAttachment }
+    })
+    const requestGateway = vi.fn(async () => ({
+      attached: true,
+      path: '/home/ai/.hermes/images/diagram.png'
+    }) as never)
+
+    await uploadComposerAttachment(
+      { id: 'image:diagram', kind: 'image', label: 'diagram.png', path: 'C:\\Temp\\diagram.png' },
+      { remote: true, requestGateway, sessionId: RUNTIME_SESSION_ID }
+    )
+
+    expect(uploadAttachment).toHaveBeenCalledWith({
+      filePath: 'C:\\Temp\\diagram.png',
+      kind: 'image',
+      name: 'diagram.png',
+      profile: 'subapi',
+      sessionId: RUNTIME_SESSION_ID
+    })
+    expect(readFileDataUrl).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('image.attach', {
+      path: '/home/ai/.hermes/images/diagram.png',
+      session_id: RUNTIME_SESSION_ID
+    })
+  })
+
   it('uploads file bytes via file.attach on a remote gateway and submits the rewritten ref', async () => {
     // Remote gateway can't read the client-disk path, so the desktop must upload
     // the bytes and submit the workspace-relative ref the gateway hands back —

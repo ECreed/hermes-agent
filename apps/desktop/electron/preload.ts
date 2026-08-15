@@ -48,6 +48,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     set: name => ipcRenderer.invoke('hermes:profile:set', name)
   },
   api: request => ipcRenderer.invoke('hermes:api', request),
+  device: {
+    getIdentity: () => ipcRenderer.invoke('hermes:device:identity'),
+    executeComputerUse: args => ipcRenderer.invoke('hermes:device:computer-use', { args })
+  },
+  uploadAttachment: payload => ipcRenderer.invoke('hermes:attachment:upload', payload),
+  downloadGatewayFile: payload => ipcRenderer.invoke('hermes:gateway-file:download', payload),
   notify: payload => ipcRenderer.invoke('hermes:notify', payload),
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),
