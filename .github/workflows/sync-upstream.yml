@@ -17,9 +17,21 @@ jobs:
     name: Sync default branch
     runs-on: ubuntu-latest
     steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Merge changes from upstream
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: gh repo sync "$REPOSITORY" --branch "$DEFAULT_BRANCH"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          upstream="$(gh repo view "$REPOSITORY" --json parent --jq '.parent.nameWithOwner')"
+          git remote add upstream "https://github.com/${upstream}.git"
+          git fetch upstream "$DEFAULT_BRANCH"
+          git merge --no-edit "upstream/$DEFAULT_BRANCH"
+          git push origin "HEAD:$DEFAULT_BRANCH"
