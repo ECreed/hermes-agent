@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -30,7 +30,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          upstream="$(gh repo view "$REPOSITORY" --json parent --jq '.parent.nameWithOwner')"
+          upstream="$(gh repo view "$REPOSITORY" --json parent --jq '.parent.owner.login + "/" + .parent.name')"
           git remote add upstream "https://github.com/${upstream}.git"
           git fetch upstream "$DEFAULT_BRANCH"
           git merge --no-edit "upstream/$DEFAULT_BRANCH"
